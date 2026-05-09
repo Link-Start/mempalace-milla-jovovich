@@ -152,6 +152,23 @@ _init_logging()
 logger = logging.getLogger("mempalace_mcp")
 
 
+def _clean(text: str) -> str:
+    """Remove lone surrogates that break UTF-8 encoding (issue #1235).
+
+    MCP clients (Claude Desktop, WorkBuddy) can emit lone surrogates
+    (``\\udc00``–``\\udfff``) when relaying binary-in-Unicode or
+    corrupted text.  Python's ``str.encode('utf-8')`` raises
+    ``UnicodeEncodeError`` on these; ChromaDB's ``add()`` /
+    ``upsert()`` then crashes with -32000 Internal Error.
+
+    Replace lone surrogates with U+FFFD (REPLACEMENT CHARACTER) so
+    the string is legal UTF-8 while preserving as much content as
+    possible.  Paired surrogates (valid UTF-16) are left alone —
+    the Python interpreter already decoded them correctly.
+    """
+    return text.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description="MemPalace MCP Server")
     parser.add_argument(
@@ -1120,6 +1137,7 @@ def tool_add_drawer(
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
         content = sanitize_content(content)
+        content = _clean(content)
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -1128,7 +1146,7 @@ def tool_add_drawer(
         return _no_palace()
 
     drawer_id = (
-        f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode()).hexdigest()[:24]}"
+        f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content).encode('utf-8', 'surrogatepass')).hexdigest()[:24]}"
     )
 
     _wal_log(
@@ -1611,6 +1629,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
+        entry = _clean(entry)
         topic = sanitize_name(topic, "topic")
     except ValueError as e:
         return {"success": False, "error": str(e)}
@@ -1627,7 +1646,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     now = datetime.now()
     entry_id = (
         f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
-        f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
+        f"{hashlib.sha256(entry.encode('utf-8', 'surrogatepass')).hexdigest()[:12]}"
     )
 
     _wal_log(
