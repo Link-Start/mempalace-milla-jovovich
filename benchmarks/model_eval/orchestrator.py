@@ -26,7 +26,7 @@ from typing import Iterable
 
 import yaml
 
-from .runner import Result, _result_to_dict, run
+from .runner import Result, _EMBED_MODEL, _result_to_dict, run
 
 
 TASK_MODES = [
@@ -42,6 +42,7 @@ CSV_COLUMNS = [
     "model_tag",
     "task",
     "mode",
+    "language",
     "n_samples",
     "accuracy",
     "ttft_p50_ms",
@@ -87,7 +88,12 @@ def load_candidates(path: Path, tier: str) -> list[dict]:
         except ValueError:
             return []
         return [c for c in candidates if c.get("tier") == n]
-    return [c for c in candidates if c.get("tag") == tier]
+    # Specific tag, or comma-separated list of tags. Synthesize minimal entries
+    # for tags not present in candidates.yaml so ad-hoc models can be evaluated
+    # without editing the yaml.
+    requested_tags = [t.strip() for t in tier.split(",") if t.strip()]
+    known_by_tag = {c["tag"]: c for c in candidates}
+    return [known_by_tag.get(t, {"tag": t}) for t in requested_tags]
 
 
 def parse_tasks(arg: str) -> list[tuple[str, str]]:
@@ -111,6 +117,7 @@ def result_to_row(result: Result) -> dict:
         "model_tag": result.model_tag,
         "task": result.task,
         "mode": result.mode,
+        "language": result.language,
         "n_samples": result.n_samples,
         "accuracy": round(result.accuracy, 4),
         "ttft_p50_ms": round(result.timing.ttft_p50_ms, 1),
@@ -138,8 +145,25 @@ def main():
     parser.add_argument("--dataset-dir", required=True, type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--endpoint", default="http://localhost:11434")
+    parser.add_argument("--llm-provider", default="ollama",
+                        choices=["ollama", "openai-compat", "anthropic"],
+                        help="LLM provider (default: ollama)")
+    parser.add_argument("--embed-endpoint", default="http://localhost:11434",
+                        help="Endpoint for the embedding model (always Ollama). Defaults to --endpoint when using ollama provider.")
+    parser.add_argument("--embed-model", default=_EMBED_MODEL,
+                        help=f"Embedding model for semantic-similarity scoring. Default: {_EMBED_MODEL}.")
+    parser.add_argument("--num-ctx", type=int, default=None,
+                        help="Override Ollama context window per request (sent as options.num_ctx). "
+                             "Forces apples-to-apples comparison across candidates regardless of "
+                             "their Modelfile defaults.")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--n", type=int, default=None, help="Limit each task to first N samples (debug mode)")
+    parser.add_argument(
+        "--languages",
+        default="en",
+        help="Comma-separated dataset languages. 'en' uses dataset.jsonl; "
+             "other values use dataset.{lang}.jsonl. Example: 'en,pt-BR,es,zh'.",
+    )
     parser.add_argument(
         "--continue-on-error",
         action=argparse.BooleanOptionalAction,
@@ -158,13 +182,19 @@ def main():
         print(f"No tasks matched: {args.tasks}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Running {len(candidates)} candidates × {len(task_modes)} task/mode pairs = {len(candidates) * len(task_modes)} runs")
+    languages = [lang.strip() for lang in args.languages.split(",") if lang.strip()]
+    if not languages:
+        languages = ["en"]
+
+    n_runs = len(candidates) * len(task_modes) * len(languages)
+    print(f"Running {len(candidates)} candidates × {len(task_modes)} task/mode × {len(languages)} languages = {n_runs} runs")
+    print(f"Languages: {languages}")
     print(f"Output: {args.output}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     rows = []
-    total = len(candidates) * len(task_modes)
+    total = n_runs
     i = 0
     start = time.time()
 
@@ -179,28 +209,34 @@ def main():
         for candidate in candidates:
             tag = candidate["tag"]
             for task, mode in task_modes:
-                i += 1
-                print(f"[{i}/{total}] {tag}  {task}  {mode}", flush=True)
-                try:
-                    result = run(
-                        model_tag=tag,
-                        task=task,
-                        mode=mode,
-                        dataset_dir=args.dataset_dir,
-                        endpoint=args.endpoint,
-                        warmup=args.warmup,
-                        n_samples=args.n,
-                    )
-                except Exception as e:
-                    if not args.continue_on_error:
-                        raise
-                    print(f"  ERROR: {e}", file=sys.stderr)
-                    continue
-                row = result_to_row(result)
-                rows.append(row)
-                writer.writerow(row)
-                f.flush()
-                print(f"  acc={row['accuracy']}  e2e_p50={row['e2e_p50_ms']}ms  vram={row['vram_resident_mb']}", flush=True)
+                for language in languages:
+                    i += 1
+                    print(f"[{i}/{total}] {tag}  {task}  {mode}  lang={language}", flush=True)
+                    try:
+                        result = run(
+                            model_tag=tag,
+                            task=task,
+                            mode=mode,
+                            dataset_dir=args.dataset_dir,
+                            endpoint=args.endpoint,
+                            warmup=args.warmup,
+                            n_samples=args.n,
+                            llm_provider=args.llm_provider,
+                            embed_endpoint=args.embed_endpoint,
+                            embed_model=args.embed_model,
+                            language=language,
+                            num_ctx=args.num_ctx,
+                        )
+                    except Exception as e:
+                        if not args.continue_on_error:
+                            raise
+                        print(f"  ERROR: {e}", file=sys.stderr)
+                        continue
+                    row = result_to_row(result)
+                    rows.append(row)
+                    writer.writerow(row)
+                    f.flush()
+                    print(f"  acc={row['accuracy']}  e2e_p50={row['e2e_p50_ms']}ms  vram={row['vram_resident_mb']}", flush=True)
 
     elapsed = time.time() - start
     print(f"\nDone in {elapsed/60:.1f}min. Wrote {len(rows)} rows to {args.output}")

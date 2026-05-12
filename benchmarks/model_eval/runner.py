@@ -57,9 +57,10 @@ class Result:
     run_date: str
     n_samples: int
     error: Optional[str] = None
+    language: str = "en"
 
 
-_EMBED_MODEL = "nomic-embed-text"
+_EMBED_MODEL = "embeddinggemma"
 
 # Tasks that score via semantic similarity and require an embedding model.
 _EMBED_TASKS: set[tuple[str, str]] = {
@@ -158,17 +159,17 @@ def _build_prompt(task: str, mode: str, sample: dict, label: dict) -> tuple[str,
     raise ValueError(f"Unknown task: {task}")
 
 
-def _score_one(task: str, mode: str, predicted: str, sample: dict, label: dict, endpoint: str) -> dict:
+def _score_one(task: str, mode: str, predicted: str, sample: dict, label: dict, endpoint: str, embed_model: str = _EMBED_MODEL) -> dict:
     if task == "calibration":
         return cal_score.score(predicted, label["label"], sample["classes"])
     if task == "room_classification":
         if mode == "closed":
             return rc_score.score_closed(predicted, label["closed_set_label"], sample["__rooms__"])
-        return rc_score.score_open(predicted, label["preferred_open_label"], endpoint=endpoint)
+        return rc_score.score_open(predicted, label["preferred_open_label"], embed_model=embed_model, endpoint=endpoint)
     if task == "entity_extraction":
         return ent_score.score(predicted, label["entities"])
     if task == "memory_extraction":
-        return mem_score.score(predicted, label["memories"], endpoint=endpoint)
+        return mem_score.score(predicted, label["memories"], embed_model=embed_model, endpoint=endpoint)
     raise ValueError(f"Unknown task: {task}")
 
 
@@ -231,20 +232,40 @@ def run(
     warmup: int = 1,
     n_samples: Optional[int] = None,
     strip_thinking: bool = True,
+    llm_provider: str = "ollama",
+    embed_endpoint: str = "http://localhost:11434",
+    embed_model: str = _EMBED_MODEL,
+    language: str = "en",
+    num_ctx: Optional[int] = None,
 ) -> Result:
-    """Run one (model, task, mode) triple. Returns a Result."""
+    """Run one (model, task, mode) triple. Returns a Result.
+
+    When language != "en", loads `dataset.{language}.jsonl` instead of `dataset.jsonl`.
+    Labels and room_lists are always loaded from the English files — non-English inputs
+    are scored against the same English ground truth (cross-lingual mapping test).
+    """
     host = gather_host_info()
     run_date = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
     task_dir = dataset_dir / task
-    samples = load_jsonl(task_dir / "dataset.jsonl")
+    dataset_file = "dataset.jsonl" if language == "en" else f"dataset.{language}.jsonl"
+    dataset_path = task_dir / dataset_file
+    if not dataset_path.exists():
+        return Result(
+            model_tag=model_tag, task=task, mode=mode,
+            accuracy=0.0, extras={}, timing=aggregate_timings([]),
+            vram_resident_mb=None, vram_peak_mb=None, host=host,
+            run_date=run_date, n_samples=0, language=language,
+            error=f"Dataset not found: {dataset_path}",
+        )
+    samples = load_jsonl(dataset_path)
     labels = load_jsonl(task_dir / "labels.jsonl")
     if len(samples) != len(labels):
         return Result(
             model_tag=model_tag, task=task, mode=mode,
             accuracy=0.0, extras={}, timing=aggregate_timings([]),
             vram_resident_mb=None, vram_peak_mb=None, host=host,
-            run_date=run_date, n_samples=0,
+            run_date=run_date, n_samples=0, language=language,
             error=f"Sample/label count mismatch: {len(samples)} vs {len(labels)}",
         )
 
@@ -255,7 +276,7 @@ def run(
                 model_tag=model_tag, task=task, mode=mode,
                 accuracy=0.0, extras={}, timing=aggregate_timings([]),
                 vram_resident_mb=None, vram_peak_mb=None, host=host,
-                run_date=run_date, n_samples=0,
+                run_date=run_date, n_samples=0, language=language,
                 error=f"Room-list count mismatch: {len(room_lists)} vs {len(samples)}",
             )
         for s, rl in zip(samples, room_lists):
@@ -267,24 +288,27 @@ def run(
 
     if (task, mode) in _EMBED_TASKS:
         try:
-            _ensure_embed_model(endpoint)
+            _ensure_embed_model(embed_endpoint, model=embed_model)
         except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
             return Result(
                 model_tag=model_tag, task=task, mode=mode,
                 accuracy=0.0, extras={}, timing=aggregate_timings([]),
                 vram_resident_mb=None, vram_peak_mb=None, host=host,
-                run_date=run_date, n_samples=0,
+                run_date=run_date, n_samples=0, language=language,
                 error=f"Embedding model unavailable: {e}",
             )
 
     try:
-        provider = get_provider("ollama", model=model_tag, endpoint=endpoint, timeout=180)
+        provider_kwargs: dict = {}
+        if num_ctx is not None:
+            provider_kwargs["num_ctx"] = num_ctx
+        provider = get_provider(llm_provider, model=model_tag, endpoint=endpoint, timeout=180, **provider_kwargs)
     except LLMError as e:
         return Result(
             model_tag=model_tag, task=task, mode=mode,
             accuracy=0.0, extras={}, timing=aggregate_timings([]),
             vram_resident_mb=None, vram_peak_mb=None, host=host,
-            run_date=run_date, n_samples=0,
+            run_date=run_date, n_samples=0, language=language,
             error=f"Provider init failed: {e}",
         )
 
@@ -299,7 +323,7 @@ def run(
                 model_tag=model_tag, task=task, mode=mode,
                 accuracy=0.0, extras={}, timing=aggregate_timings([]),
                 vram_resident_mb=None, vram_peak_mb=None, host=host,
-                run_date=run_date, n_samples=0,
+                run_date=run_date, n_samples=0, language=language,
                 error=f"Warmup failed: {e}",
             )
 
@@ -321,13 +345,17 @@ def run(
             text = strip_thinking_tokens(text, response.raw)
         timings.append(timing)
         try:
-            score_result = _score_one(task, mode, text, sample, label, endpoint)
+            score_result = _score_one(task, mode, text, sample, label, embed_endpoint, embed_model=embed_model)
             scores.append(score_result)
         except Exception as e:
             errors.append(f"score error: {e}")
 
     peak_vram = poller.stop()
-    resident_vram = vram_resident_mb(model_tag, endpoint=endpoint)
+    # vram_resident_mb queries Ollama's /api/ps; meaningless for non-Ollama providers.
+    if llm_provider == "ollama":
+        resident_vram = vram_resident_mb(model_tag, endpoint=endpoint)
+    else:
+        resident_vram = None
 
     accuracy, extras = _aggregate_accuracy(task, mode, scores)
     if errors:
@@ -346,6 +374,7 @@ def run(
         host=host,
         run_date=run_date,
         n_samples=len(scores),
+        language=language,
     )
 
 
@@ -359,6 +388,20 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--n", type=int, default=None, help="Limit to first N samples (for debugging)")
     parser.add_argument("--no-strip-thinking", action="store_true")
+    parser.add_argument("--llm-provider", default="ollama",
+                        choices=["ollama", "openai-compat", "anthropic"],
+                        help="LLM provider (default: ollama)")
+    parser.add_argument("--language", default="en",
+                        help="Dataset language suffix. 'en' loads dataset.jsonl; "
+                             "other values load dataset.{lang}.jsonl (e.g. pt-BR, es, zh).")
+    parser.add_argument("--embed-model", default=_EMBED_MODEL,
+                        help=f"Embedding model for semantic-similarity scoring "
+                             f"(memory_extraction, room_classification:open). "
+                             f"Default: {_EMBED_MODEL}.")
+    parser.add_argument("--num-ctx", type=int, default=None,
+                        help="Override Ollama context window per request (sent as options.num_ctx). "
+                             "When set, overrides the model's Modelfile default — useful for "
+                             "apples-to-apples comparison across candidates with different defaults.")
     args = parser.parse_args()
 
     if args.task != "room_classification" and args.mode in ("closed", "open"):
@@ -373,6 +416,10 @@ def main():
         warmup=args.warmup,
         n_samples=args.n,
         strip_thinking=not args.no_strip_thinking,
+        llm_provider=args.llm_provider,
+        language=args.language,
+        embed_model=args.embed_model,
+        num_ctx=args.num_ctx,
     )
 
     print(json.dumps(_result_to_dict(result), indent=2))
@@ -385,6 +432,7 @@ def _result_to_dict(r: Result) -> dict:
         "model_tag": r.model_tag,
         "task": r.task,
         "mode": r.mode,
+        "language": r.language,
         "n_samples": r.n_samples,
         "accuracy": round(r.accuracy, 4),
         "extras": r.extras,
