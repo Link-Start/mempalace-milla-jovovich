@@ -197,16 +197,16 @@ def test_cache_key_separates_models(monkeypatch):
 
 
 def test_missing_deps_raise_helpful_error(monkeypatch):
-    """If the user hasn't installed `mempalace[multilingual]`, the error must
-    name the extra rather than just spilling a bare ImportError."""
+    """Multilingual deps now ship in core, but if a user ends up with a broken
+    install (uninstalled tokenizers, incompatible pin, etc.) the error should
+    tell them how to recover rather than spilling a bare ImportError."""
 
-    # Drop tokenizers from sys.modules and block re-import, simulating a user
-    # who didn't install the multilingual extra. huggingface_hub and onnxruntime
-    # are present (they ship with core), so the failure should land on tokenizers.
+    # Simulate a user with a broken install: drop tokenizers from sys.modules
+    # and block re-import. huggingface_hub and onnxruntime stay importable.
     monkeypatch.setitem(sys.modules, "tokenizers", None)
 
     ef = embedding.EmbeddinggemmaONNX()
-    with pytest.raises(ImportError, match=r"mempalace\[multilingual\]"):
+    with pytest.raises(ImportError, match=r"pip install.*mempalace"):
         ef(["anything"])
 
 

@@ -30,6 +30,16 @@ dependencies = [
     "chromadb>=1.5.4,<2",
     "pyyaml>=6.0,<7",
     "tomli>=2.0.0; python_version < '3.11'",
+    # Multilingual embedding model deps. Onboarding now offers the
+    # embeddinggemma-300m ONNX model as the default for new installs, so
+    # these are required core deps (not optional extras). The 300 MB ONNX
+    # model itself is lazy-downloaded on first use, not at install time.
+    # Users who pick minilm during onboarding still get these installed
+    # but unused — small wheel-size cost in exchange for one fewer pip
+    # command in the multilingual setup path.
+    "huggingface_hub>=0.20",
+    "tokenizers>=0.15",
+    "numpy>=1.24",
 ]
 
 [project.urls]
@@ -61,14 +71,9 @@ spellcheck = ["autocorrect>=2.0"]
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]
-# Multilingual embedding (embeddinggemma-300m, 100+ languages, MRL→384d).
-# Required when MEMPALACE_EMBEDDING_MODEL=embeddinggemma. Lazy-downloads
-# ~300 MB from HuggingFace on first use; cached under ~/.cache/huggingface/.
-multilingual = [
-    "huggingface-hub>=0.20",
-    "tokenizers>=0.15",
-    "numpy>=1.24",
-]
+# Multilingual extra kept as a no-op alias for back-compat with
+# `pip install mempalace[multilingual]` — these deps now ship in core.
+multilingual = []
 
 [dependency-groups]
 dev = ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.4.0", "psutil>=5.9"]

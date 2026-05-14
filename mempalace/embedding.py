@@ -10,9 +10,11 @@ or ``embedding_model`` in ``~/.mempalace/config.json``:
   ChromaDB's default; what every existing palace was built with.
 * ``embeddinggemma`` — ``onnx-community/embeddinggemma-300m-ONNX`` (q8), 384-dim
   via Matryoshka truncation, multilingual (100+ languages). Cross-lingual cos
-  ~0.88 on parallel translations vs MiniLM's ~0.35. Requires
-  ``pip install mempalace[multilingual]``. Switching models on an existing
-  palace requires ``mempalace repair rebuild-index`` (different vector space).
+  ~0.88 on parallel translations vs MiniLM's ~0.35. Recommended for any
+  non-English use; onboarding offers it as the default. The ~300 MB ONNX
+  model is lazy-downloaded from HuggingFace on first use. Switching models
+  on an existing palace requires ``mempalace repair rebuild-index``
+  (different vector space).
 
 Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
 in ``~/.mempalace/config.json``):
@@ -173,8 +175,10 @@ class EmbeddinggemmaONNX:
             from tokenizers import Tokenizer
         except ImportError as e:
             raise ImportError(
-                "EmbeddinggemmaONNX requires huggingface_hub and tokenizers. "
-                "Install with: pip install mempalace[multilingual]"
+                "EmbeddinggemmaONNX requires huggingface_hub, tokenizers, and "
+                "numpy — these ship with mempalace core, so this error usually "
+                "means one was uninstalled or pinned to an incompatible version. "
+                "Reinstall with: pip install --upgrade --force-reinstall mempalace"
             ) from e
 
         logger.info("Downloading %s/%s (cached after first run)…", _EMBEDDINGGEMMA_REPO, _EMBEDDINGGEMMA_ONNX)
