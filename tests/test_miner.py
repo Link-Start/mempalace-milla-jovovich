@@ -55,6 +55,105 @@ def test_project_mining():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_mine_computes_hallways_for_wing_post_mine(monkeypatch):
+    """After mine() completes (non-dry-run), compute_hallways_for_wing must be
+    called once with the wing name and the live collection.
+
+    This is the integration test for the hallway primitive — without this
+    call, the hallway module is dead code (no miner triggers it). Mirrors
+    the existing tunnel-computation integration pattern at miner.py:1241.
+    """
+
+    from mempalace import miner as miner_mod
+
+    hallway_calls = []
+
+    def fake_compute(wing, col=None, min_count=2):
+        hallway_calls.append({"wing": wing, "col": col, "min_count": min_count})
+        return []  # no hallways materialized — that's not what we're testing
+
+    # Patch at the call site (mempalace.miner.compute_hallways_for_wing) so
+    # the integration in mine() routes through our stub.
+    monkeypatch.setattr(miner_mod, "compute_hallways_for_wing", fake_compute)
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        os.makedirs(project_root / "backend")
+        write_file(
+            project_root / "backend" / "app.py",
+            "def main():\n    print('hello world')\n" * 20,
+        )
+        with open(project_root / "mempalace.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "wing": "test_project",
+                    "rooms": [{"name": "backend", "description": "Backend code"}],
+                },
+                f,
+            )
+
+        palace_path = project_root / "palace"
+        mine(str(project_root), str(palace_path))
+
+        # Must have been called exactly once, with our wing name + a live
+        # collection. We don't pin min_count — the integration may pick a
+        # default that differs from the function's own default.
+        assert len(hallway_calls) == 1, (
+            f"expected compute_hallways_for_wing to be called once, got {len(hallway_calls)}"
+        )
+        call = hallway_calls[0]
+        assert call["wing"] == "test_project"
+        assert call["col"] is not None, (
+            "must pass the live collection so hallways can query drawers"
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_hallway_failure_does_not_crash_mine(monkeypatch):
+    """If compute_hallways_for_wing raises, the mine must still complete.
+
+    Mirrors the try/except wrap around the existing tunnel-computation block
+    at miner.py:1244-1249. Hallway computation is a derived analytic, not
+    load-bearing for the drawer write itself.
+    """
+    from mempalace import miner as miner_mod
+
+    def angry_compute(wing, col=None, min_count=2):
+        raise RuntimeError("simulated hallway-compute explosion")
+
+    monkeypatch.setattr(miner_mod, "compute_hallways_for_wing", angry_compute)
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        os.makedirs(project_root / "backend")
+        write_file(
+            project_root / "backend" / "app.py",
+            "def main():\n    print('hello world')\n" * 20,
+        )
+        with open(project_root / "mempalace.yaml", "w") as f:
+            yaml.dump(
+                {
+                    "wing": "test_project",
+                    "rooms": [{"name": "backend", "description": "Backend code"}],
+                },
+                f,
+            )
+
+        palace_path = project_root / "palace"
+        # Must NOT raise — the failure has to be caught + logged but not propagated.
+        mine(str(project_root), str(palace_path))
+
+        # Drawer-write side of the mine still committed.
+        client = chromadb.PersistentClient(path=str(palace_path))
+        col = client.get_collection("mempalace_drawers")
+        assert col.count() > 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_load_config_uses_defaults_when_yaml_missing():
     tmpdir = tempfile.mkdtemp()
     try:

@@ -33,6 +33,12 @@ from .palace import (
     upsert_closet_lines,
 )
 
+# Module-level import so tests can patch it as
+# ``mempalace.miner.compute_hallways_for_wing``. The integration call
+# lives at the end of _mine_impl, alongside the existing
+# ``_compute_topic_tunnels_for_wing`` post-mine block.
+from .hallways import compute_hallways_for_wing
+
 logger = logging.getLogger("mempalace_mcp")
 
 READABLE_EXTENSIONS = {
@@ -1245,6 +1251,21 @@ def _mine_impl(
                 # Tunnel computation must never fail a mine — degrade quietly.
                 print(
                     f"\n  WARNING: topic tunnel computation skipped — {e}",
+                    file=sys.stderr,
+                )
+
+            # Within-wing hallways: link entities (people, projects, concepts)
+            # that co-occur in drawers across this wing's rooms. Mirrors the
+            # tunnel-compute fault-tolerance pattern — hallway computation
+            # must never fail a mine; it's a derived analytic, not load-bearing
+            # for the drawer write that already committed above.
+            try:
+                hallways_created = compute_hallways_for_wing(wing, col=collection)
+                if hallways_created:
+                    print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
+            except Exception as e:
+                print(
+                    f"\n  WARNING: hallway computation skipped — {e}",
                     file=sys.stderr,
                 )
 
