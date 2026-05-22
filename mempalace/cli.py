@@ -691,6 +691,111 @@ def cmd_search(args):
         sys.exit(1)
 
 
+def cmd_read(args):
+    """Resolve a closet pointer and print the surgical line-range slice.
+
+    Resurrects the original ``read.py`` concept Aya designed with Lumi —
+    closet pointer in, only-the-matched-lines out. See ``mempalace.reader``
+    for the parse/resolve/render logic; this handler is the argparse +
+    interactive-prompt glue.
+    """
+    from .palace import _open_collection_or_explain
+    from .reader import format_drawer_menu, parse_pointer, read_slice, resolve_drawers
+
+    # Source the pointer from arg or stdin.
+    pointer = args.pointer
+    if pointer is None or pointer == "-":
+        pointer = sys.stdin.read().strip()
+    if not pointer:
+        print(
+            "Error: no pointer provided. Pass as argument or pipe via stdin.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Reject mutually exclusive flags upfront.
+    if args.drawer is not None and args.all:
+        print("Error: --drawer and --all are mutually exclusive.", file=sys.stderr)
+        sys.exit(1)
+
+    # Parse the pointer.
+    try:
+        parsed = parse_pointer(pointer)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Open the palace collection.
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    col = _open_collection_or_explain(palace_path)
+    if col is None:
+        # ``_open_collection_or_explain`` already printed a state-specific message.
+        sys.exit(1)
+
+    # Resolve to drawer candidates.
+    candidates = resolve_drawers(col, parsed)
+    if not candidates:
+        print("Error: no drawers found for this pointer.", file=sys.stderr)
+        sys.exit(1)
+
+    # Single drawer or --all flag: render directly, no prompt.
+    if len(candidates) == 1 and not args.all:
+        print(read_slice(candidates[0]))
+        return
+
+    if args.all:
+        _print_all_candidates(candidates)
+        return
+
+    # Non-interactive --drawer N selection.
+    if args.drawer is not None:
+        idx = args.drawer
+        if idx < 1 or idx > len(candidates):
+            print(
+                f"Error: --drawer {idx} out of range (1-{len(candidates)}).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(read_slice(candidates[idx - 1]))
+        return
+
+    # Interactive picker.
+    print(format_drawer_menu(candidates))
+    print()
+    try:
+        choice = input(f"Which one? [1-{len(candidates)}, or 'all']: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)
+
+    if choice.lower() == "all":
+        _print_all_candidates(candidates)
+        return
+    try:
+        idx = int(choice)
+    except ValueError:
+        print(f"Error: invalid choice {choice!r}.", file=sys.stderr)
+        sys.exit(1)
+    if idx < 1 or idx > len(candidates):
+        print(
+            f"Error: choice {idx} out of range (1-{len(candidates)}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(read_slice(candidates[idx - 1]))
+
+
+def _print_all_candidates(candidates):
+    """Concatenate all candidates' slices with a separator between them."""
+    from .reader import read_slice
+
+    for i, cand in enumerate(candidates, start=1):
+        if i > 1:
+            print()
+        print(f"─── [{i}] chunk {cand.chunk_index} " + "─" * 30)
+        print(read_slice(cand))
+
+
 def cmd_wakeup(args):
     """Show L0 (identity) + L1 (essential story) — the wake-up context."""
     from .layers import MemoryStack
@@ -1387,6 +1492,37 @@ def main():
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
 
+    # read — consume a closet pointer, return the surgical line-range slice.
+    # Accepts full Tier 6a closet pointer, legacy 3-segment closet pointer,
+    # OR shorthand "YYYY-MM-DD:Lstart-Lend source_file.md". If no positional
+    # argument is given, reads from stdin so callers can do:
+    #     mempalace search "X" | mempalace read
+    p_read = sub.add_parser(
+        "read",
+        help="Read the slice referenced by a closet pointer",
+    )
+    p_read.add_argument(
+        "pointer",
+        nargs="?",
+        default=None,
+        help=(
+            "Closet pointer or shorthand. If omitted (or '-'), read from stdin. "
+            "Examples: '2024-11-08:L42-L78 file.md' or "
+            "'topic|entities|2024-11-08:L42-L78|→drawer_a,drawer_b'."
+        ),
+    )
+    p_read.add_argument(
+        "--drawer",
+        type=int,
+        default=None,
+        help="When the pointer matches multiple drawers, pick the N-th (1-indexed) non-interactively.",
+    )
+    p_read.add_argument(
+        "--all",
+        action="store_true",
+        help="Read every drawer the pointer matches, concatenated with separators.",
+    )
+
     # compress
     p_compress = sub.add_parser(
         "compress", help="Compress drawers using AAAK Dialect (~30x reduction)"
@@ -1587,6 +1723,7 @@ def main():
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,
+        "read": cmd_read,
         "sweep": cmd_sweep,
         "sync": cmd_sync,
         "mcp": cmd_mcp,
