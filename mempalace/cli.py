@@ -716,6 +716,12 @@ def cmd_read(args):
                 'Example: mempalace read "2024-11-08:L42-L78 file.md"',
                 file=sys.stderr,
             )
+    if pointer is None or pointer == "-":
+        if sys.stdin.isatty():
+            print(
+                "Error: no pointer provided. Pass as argument or pipe via stdin.",
+                file=sys.stderr,
+            )
             sys.exit(1)
         pointer = sys.stdin.read().strip()
     if not pointer:
