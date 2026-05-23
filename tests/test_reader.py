@@ -1238,6 +1238,171 @@ class TestCmdReadCLISubprocess:
         ), f"argparse must surface the mutex constraint; got stderr={rejected.stderr!r}"
 
 
+# Final-amendment audit fixes (G1-G4 from PR-1588-AUDIT.md):
+#   G1: replace interactive picker with clean error (no stdin dependency)
+#   G2: _make_snippet perf — slice before split (gemini Medium A)
+#   G3: sys.stdin.readline() vs .read() (gemini Medium B)
+#   G4: _resolve_by_ids preserves pointer-order
+
+
+class TestG1NoInteractivePicker:
+    """Multi-candidate pointer + no --drawer/--all must produce a clean
+    error message to stderr (NOT enter an interactive input() block).
+    The picker was the source of every stdin/TTY/input() bot finding;
+    removing it kills the entire class.
+    """
+
+    def test_multi_candidate_no_flag_exits_with_clean_error(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from mempalace.cli import cmd_read
+        from mempalace.reader import DrawerCandidate, ParsedPointer
+
+        candidates = [
+            DrawerCandidate(
+                drawer_id=f"d{i}",
+                source_file=f"/p/{i}.md",
+                chunk_index=0,
+                line_start=1,
+                line_end=10,
+                document="x",
+            )
+            for i in range(3)
+        ]
+        parsed = ParsedPointer(
+            date=None, line_start=None, line_end=None, source_file="x.md", drawer_ids=[]
+        )
+        args = SimpleNamespace(
+            pointer="2024-11-08:L1-L10 x.md", drawer=None, all=False, palace=None
+        )
+
+        with (
+            patch("mempalace.palace._open_collection_or_explain") as mock_open,
+            patch("mempalace.reader.parse_pointer", return_value=parsed),
+            patch("mempalace.reader.resolve_drawers", return_value=candidates),
+        ):
+            mock_open.return_value = object()
+            with pytest.raises(SystemExit) as excinfo:
+                cmd_read(args)
+            assert excinfo.value.code == 1, (
+                f"multi-candidate no-flag must exit 1; got {excinfo.value.code}"
+            )
+
+    def test_multi_candidate_no_flag_does_not_call_input(self):
+        """The input() function must NOT be called anywhere in the
+        multi-candidate-no-flag path."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from mempalace.cli import cmd_read
+        from mempalace.reader import DrawerCandidate, ParsedPointer
+
+        candidates = [
+            DrawerCandidate("d1", "/p/a.md", 0, 1, 10, "a"),
+            DrawerCandidate("d2", "/p/b.md", 0, 1, 10, "b"),
+        ]
+        parsed = ParsedPointer(None, None, None, "x.md", [])
+        args = SimpleNamespace(
+            pointer="2024-11-08:L1-L10 x.md", drawer=None, all=False, palace=None
+        )
+
+        with (
+            patch("mempalace.palace._open_collection_or_explain", return_value=object()),
+            patch("mempalace.reader.parse_pointer", return_value=parsed),
+            patch("mempalace.reader.resolve_drawers", return_value=candidates),
+            patch("builtins.input") as mock_input,
+        ):
+            mock_input.side_effect = AssertionError(
+                "input() must NOT be called — picker is removed"
+            )
+            with pytest.raises(SystemExit):
+                cmd_read(args)
+            mock_input.assert_not_called()
+
+
+class TestG2SnippetPerfSliceBeforeSplit:
+    """_make_snippet must NOT call document.split() on the entire
+    document for a 120-char snippet. Slicing first bounds the work.
+    """
+
+    def test_snippet_does_not_tokenize_full_document(self):
+        """Verify the slicing happens — pass a giant document and
+        verify the snippet was produced in time AND has correct content."""
+        import time
+        from mempalace.reader import _make_snippet, _SNIPPET_MAX_CHARS
+
+        # 10MB document — splitting the whole thing would be slow
+        # but slicing first should complete instantly.
+        big = ("alpha bravo charlie delta echo foxtrot " * 250_000)[:10_000_000]
+        start = time.monotonic()
+        out = _make_snippet(big)
+        elapsed = time.monotonic() - start
+
+        # Must complete fast — sub-second on any reasonable machine.
+        # If we're tokenizing 10MB, we'd see >1 second easily.
+        assert elapsed < 0.1, (
+            f"_make_snippet too slow on 10MB doc ({elapsed:.3f}s) — "
+            f"must slice before split per perf fix"
+        )
+        # Correctness: snippet length is within bounds.
+        assert len(out) <= _SNIPPET_MAX_CHARS
+        # Snippet shouldn't be empty since the doc has content.
+        assert out
+
+
+class TestG3StdinReadline:
+    """When pointer comes from stdin, use readline() not read() —
+    pointer is a single line by contract, and read() would consume
+    arbitrarily large stdin payloads.
+    """
+
+    def test_stdin_pointer_uses_readline_not_read(self):
+        """Mock sys.stdin to verify readline is called and read is NOT."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from mempalace.cli import cmd_read
+
+        args = SimpleNamespace(pointer=None, drawer=None, all=False, palace=None)
+        with patch("mempalace.cli.sys.stdin") as mock_stdin:
+            mock_stdin.isatty.return_value = False
+            mock_stdin.readline.return_value = "garbage_pointer\n"
+            mock_stdin.read.side_effect = AssertionError(
+                "stdin.read() must NOT be called — use readline() for single-line pointer"
+            )
+            with pytest.raises(SystemExit):
+                cmd_read(args)
+            mock_stdin.readline.assert_called()
+            mock_stdin.read.assert_not_called()
+
+
+class TestG4ResolveByIdsPreservesPointerOrder:
+    """When a closet pointer lists drawer IDs in a specific order
+    (e.g., '→d3,d1,d2'), _resolve_by_ids must return candidates in
+    THAT order, not in chromadb's storage order.
+    """
+
+    def test_candidates_returned_in_input_order(self):
+        from unittest.mock import MagicMock
+        from mempalace.reader import _resolve_by_ids
+
+        col = MagicMock()
+        # Return IDs in a DIFFERENT order than requested to prove sort.
+        col.get.return_value = {
+            "ids": ["d1", "d2", "d3"],  # storage order
+            "documents": ["doc_1", "doc_2", "doc_3"],
+            "metadatas": [
+                {"source_file": "/p/x.md", "chunk_index": 1},
+                {"source_file": "/p/x.md", "chunk_index": 2},
+                {"source_file": "/p/x.md", "chunk_index": 3},
+            ],
+        }
+        # User pointer lists them as d3, d1, d2 — that order matters.
+        result = _resolve_by_ids(col, ["d3", "d1", "d2"])
+        assert [c.drawer_id for c in result] == ["d3", "d1", "d2"], (
+            f"candidates must preserve pointer-order ['d3','d1','d2']; "
+            f"got {[c.drawer_id for c in result]!r}"
+        )
+
+
 # Gemini-bot consistency-pass — log on every bare-except site
 
 

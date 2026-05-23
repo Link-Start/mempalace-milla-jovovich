@@ -717,7 +717,10 @@ def cmd_read(args):
                 file=sys.stderr,
             )
             sys.exit(1)
-        pointer = sys.stdin.read().strip()
+        # Closet pointers are single-line by contract. Use readline()
+        # rather than read() so a huge stdin payload can't blow up
+        # memory if a user accidentally pipes the wrong stream.
+        pointer = sys.stdin.readline().strip()
     if not pointer:
         print(
             "Error: no pointer provided. Pass as argument or pipe via stdin.",
@@ -772,30 +775,19 @@ def cmd_read(args):
         print(read_slice(candidates[idx - 1], requested_line_start=ls, requested_line_end=le))
         return
 
-    # Interactive picker.
-    print(format_drawer_menu(candidates))
-    print()
-    try:
-        choice = input(f"Which one? [1-{len(candidates)}, or 'all']: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\nAborted.", file=sys.stderr)
-        sys.exit(130)
-
-    if choice.lower() == "all":
-        _print_all_candidates(candidates, ls, le)
-        return
-    try:
-        idx = int(choice)
-    except ValueError:
-        print(f"Error: invalid choice {choice!r}.", file=sys.stderr)
-        sys.exit(1)
-    if idx < 1 or idx > len(candidates):
-        print(
-            f"Error: choice {idx} out of range (1-{len(candidates)}).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    print(read_slice(candidates[idx - 1], requested_line_start=ls, requested_line_end=le))
+    # Multi-candidate, no flag → clean error. The interactive picker
+    # was the source of every stdin/TTY/input() bot finding and had
+    # untested code paths. Replacing it with a deterministic error
+    # message + the menu to stderr makes the verb fully scriptable
+    # and removes the entire class of bugs.
+    print(
+        f"Error: pointer matched {len(candidates)} drawers. "
+        "Re-run with --drawer N (1-indexed) or --all to select.",
+        file=sys.stderr,
+    )
+    print(file=sys.stderr)
+    print(format_drawer_menu(candidates), file=sys.stderr)
+    sys.exit(1)
 
 
 def _print_all_candidates(candidates, requested_line_start=None, requested_line_end=None):

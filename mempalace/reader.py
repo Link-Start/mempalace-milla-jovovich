@@ -231,7 +231,14 @@ def _chunked_get(col, ids: list[str], include: list[str], batch: int = 500) -> d
 
 
 def _resolve_by_ids(col, drawer_ids: list[str]) -> list[DrawerCandidate]:
-    """Fetch drawers by explicit id list."""
+    """Fetch drawers by explicit id list, preserving the input order.
+
+    Closet pointers list drawer IDs in a specific order that carries
+    semantic meaning (chunks in narrative order, for example). ChromaDB's
+    ``col.get`` returns results in its own storage order, NOT the order
+    of the input ID list. We re-order the response to match what the
+    caller asked for.
+    """
     try:
         result = _chunked_get(col, list(drawer_ids), include=["documents", "metadatas"])
     except Exception as e:
@@ -240,22 +247,24 @@ def _resolve_by_ids(col, drawer_ids: list[str]) -> list[DrawerCandidate]:
         # for partial-result / no-recovery situations).
         logger.warning("_resolve_by_ids: fetch failed: %s", e)
         return []
-    candidates: list[DrawerCandidate] = []
+    # Index by drawer_id so we can return in input-order.
+    by_id: dict[str, DrawerCandidate] = {}
     for did, doc, meta in zip(
         result.get("ids") or [], result.get("documents") or [], result.get("metadatas") or []
     ):
         meta = meta or {}
-        candidates.append(
-            DrawerCandidate(
-                drawer_id=did,
-                source_file=meta.get("source_file", ""),
-                chunk_index=int(meta.get("chunk_index", 0) or 0),
-                line_start=_optional_int(meta.get("line_start")),
-                line_end=_optional_int(meta.get("line_end")),
-                document=doc or "",
-            )
+        by_id[did] = DrawerCandidate(
+            drawer_id=did,
+            source_file=meta.get("source_file", ""),
+            chunk_index=int(meta.get("chunk_index", 0) or 0),
+            line_start=_optional_int(meta.get("line_start")),
+            line_end=_optional_int(meta.get("line_end")),
+            document=doc or "",
         )
-    return candidates
+    # Return in the order the caller requested. Missing IDs (not found
+    # in the palace) are silently skipped — that's the existing
+    # graceful-degradation contract for this resolver.
+    return [by_id[did] for did in drawer_ids if did in by_id]
 
 
 def _resolve_by_source(col, source_file: str) -> list[DrawerCandidate]:
@@ -448,11 +457,18 @@ def format_drawer_menu(candidates: list[DrawerCandidate]) -> str:
 
 
 def _make_snippet(document: str) -> str:
-    """Produce a single-line truncated preview of the drawer's document."""
+    """Produce a single-line truncated preview of the drawer's document.
+
+    Slice the document BEFORE splitting on whitespace — we only need
+    ``_SNIPPET_MAX_CHARS`` characters of output, so tokenizing the
+    entire document (which could be tens of MB) is wasteful. The
+    leading 2× slice gives plenty of room for whitespace normalization
+    without unbounded work.
+    """
     if not document:
         return ""
-    # Normalize whitespace + take first chunk of content
-    flat = " ".join(document.split())
+    # Bound the work — slice first, then normalize whitespace.
+    flat = " ".join(document[: _SNIPPET_MAX_CHARS * 2].split())
     if len(flat) <= _SNIPPET_MAX_CHARS:
         return flat
     return flat[: _SNIPPET_MAX_CHARS - 1].rstrip() + "…"
