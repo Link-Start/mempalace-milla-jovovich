@@ -19,9 +19,12 @@ argparse + the interactive prompt.
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import NamedTuple, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -210,6 +213,16 @@ def _chunked_get(col, ids: list[str], include: list[str], batch: int = 500) -> d
         try:
             result = col.get(ids=chunk, include=include)
         except Exception:
+            # Graceful-degradation pattern (project-wide convention for
+            # chromadb errors) — continue past the failed chunk so the
+            # caller still gets a partial result instead of a crash.
+            # But emit a WARNING so the partial-result situation is
+            # VISIBLE in logs rather than silent.
+            logger.warning(
+                "_chunked_get: chunk fetch failed (skipping batch of %d IDs); "
+                "result will be incomplete",
+                len(chunk),
+            )
             continue
         merged_ids.extend(result.get("ids") or [])
         merged_docs.extend(result.get("documents") or [])

@@ -1001,6 +1001,57 @@ class TestChunkedGet:
         assert len(result["documents"]) == 1500
         assert len(result["metadatas"]) == 1500
 
+    def test_chunk_failure_logs_warning_then_continues(self, caplog):
+        """gemini-bot Medium on `_chunked_get`'s bare except: silent skip
+        on chunk failure hides partial-result situations from the user.
+
+        Fix preserves graceful degradation (we still continue past the
+        failed chunk) but emits a WARNING log so the failure is VISIBLE
+        in diagnostics — turning silent partial-result into observable
+        partial-result.
+        """
+        import logging
+        from unittest.mock import MagicMock
+        from mempalace.reader import _chunked_get
+
+        col = MagicMock()
+        # First chunk succeeds, second chunk raises.
+        call_count = {"n": 0}
+
+        def fake_get(ids, include):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise RuntimeError("simulated chromadb hiccup")
+            return {
+                "ids": list(ids),
+                "documents": [f"doc_{i}" for i in ids],
+                "metadatas": [{"i": i} for i in ids],
+            }
+
+        col.get.side_effect = fake_get
+        with caplog.at_level(logging.WARNING, logger="mempalace.reader"):
+            result = _chunked_get(
+                col,
+                [f"id_{i}" for i in range(20)],
+                include=["documents", "metadatas"],
+                batch=10,
+            )
+
+        # Graceful-degradation contract preserved: returns merged result
+        # from the successful chunks, no exception raised.
+        assert len(result["ids"]) == 10, (
+            f"expected merged result from the successful chunk; got {len(result['ids'])}"
+        )
+        # Visibility contract added by the fix: the chunk failure
+        # produced a WARNING log line so callers + ops can SEE the
+        # partial-result situation.
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, "expected a WARNING log when a chunk fetch fails; got none"
+        msg = " ".join(r.getMessage() for r in warnings)
+        assert "chunk" in msg.lower(), (
+            f"warning should mention 'chunk' for searchability; got {msg!r}"
+        )
+
     def test_chunks_input_with_partial_last_batch(self):
         """1200 IDs with batch=500 → 500 + 500 + 200."""
         from unittest.mock import MagicMock
