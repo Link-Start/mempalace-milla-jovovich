@@ -1,6 +1,6 @@
 """Reader — consume closet pointers and return surgical drawer slices.
 
-Backs the ``mempalace read`` CLI verb (Task #87). Resurrects the original
+Backs the ``mempalace read`` CLI verb. Resurrects the original
 ``read.py`` concept Aya designed with Lumi: opening only the slice the
 closet pointer references, never the whole drawer.
 
@@ -77,8 +77,8 @@ def parse_pointer(s: str) -> ParsedPointer:
 
     Raises ``ValueError`` for empty input, malformed line ranges (end <
     start, start ≤ 0), or strings that don't match any accepted form.
-    Per /negative-tests discipline (Task #87): the failure contract is
-    pinned BEFORE the happy-path positives — see tests/test_reader.py.
+    The failure contract is pinned BEFORE the happy-path positives —
+    see ``tests/test_reader.py``.
     """
     if not s or not s.strip():
         raise ValueError("pointer is empty")
@@ -187,10 +187,40 @@ def resolve_drawers(col, parsed: ParsedPointer) -> list[DrawerCandidate]:
     return []
 
 
+def _chunked_get(col, ids: list[str], include: list[str], batch: int = 500) -> dict:
+    """Chunk ``col.get(ids=...)`` calls to stay under SQLITE_MAX_VARIABLE_NUMBER.
+
+    ChromaDB binds each ID as a SQLite ``?`` parameter; the default
+    ``SQLITE_MAX_VARIABLE_NUMBER`` limit is 999. Splitting large ID lists
+    into ``batch``-sized chunks (default 500) and merging per-batch
+    results keeps single calls comfortably under the bind limit while
+    still completing the fetch.
+
+    Returns ``{"ids": [...], "documents": [...], "metadatas": [...]}``
+    so callers can drop it in transparently for ``col.get``. On empty
+    input returns the empty-shape dict with no ``col.get`` call.
+    """
+    if not ids:
+        return {"ids": [], "documents": [], "metadatas": []}
+    merged_ids: list[str] = []
+    merged_docs: list = []
+    merged_metas: list = []
+    for i in range(0, len(ids), batch):
+        chunk = ids[i : i + batch]
+        try:
+            result = col.get(ids=chunk, include=include)
+        except Exception:
+            continue
+        merged_ids.extend(result.get("ids") or [])
+        merged_docs.extend(result.get("documents") or [])
+        merged_metas.extend(result.get("metadatas") or [])
+    return {"ids": merged_ids, "documents": merged_docs, "metadatas": merged_metas}
+
+
 def _resolve_by_ids(col, drawer_ids: list[str]) -> list[DrawerCandidate]:
     """Fetch drawers by explicit id list."""
     try:
-        result = col.get(ids=list(drawer_ids), include=["documents", "metadatas"])
+        result = _chunked_get(col, list(drawer_ids), include=["documents", "metadatas"])
     except Exception:
         return []
     candidates: list[DrawerCandidate] = []
@@ -247,29 +277,36 @@ def _resolve_by_source(col, source_file: str) -> list[DrawerCandidate]:
     except Exception:
         pass
 
-    # Fallback: scan metadatas only, identify matches, THEN fetch documents
-    # for just the matched IDs. On a 100K-drawer palace, this avoids
-    # pulling ~100 MB of document text we'd immediately discard.
+    # Fallback: paginated metadatas-only scan identifies matches by
+    # basename, then a chunked docs fetch retrieves only the matched
+    # IDs. On a 100K-drawer palace this avoids loading the whole
+    # corpus into one Python list AND keeps each ``col.get(ids=...)``
+    # call under the SQLite bind-variable limit. Pagination shape
+    # mirrors ``palace.bulk_check_mined`` (page size 1000, terminate
+    # on empty-batch or offset >= count).
     target_basename = Path(source_file).name
+    matched_ids: list[str] = []
     try:
-        meta_result = col.get(include=["metadatas"])
+        total = col.count()
+        offset = 0
+        while offset < total:
+            batch = col.get(limit=1000, offset=offset, include=["metadatas"])
+            batch_ids = batch.get("ids") or []
+            for did, meta in zip(batch_ids, batch.get("metadatas") or []):
+                meta = meta or {}
+                full_path = meta.get("source_file", "")
+                if Path(full_path).name == target_basename or full_path == source_file:
+                    matched_ids.append(did)
+            if not batch_ids:
+                break
+            offset += len(batch_ids)
     except Exception:
         return []
-    matched: list[tuple[str, dict]] = []
-    for did, meta in zip(meta_result.get("ids") or [], meta_result.get("metadatas") or []):
-        meta = meta or {}
-        full_path = meta.get("source_file", "")
-        if Path(full_path).name == target_basename or full_path == source_file:
-            matched.append((did, meta))
 
-    if not matched:
+    if not matched_ids:
         return []
 
-    matched_ids = [did for did, _ in matched]
-    try:
-        doc_result = col.get(ids=matched_ids, include=["documents", "metadatas"])
-    except Exception:
-        return []
+    doc_result = _chunked_get(col, matched_ids, include=["documents", "metadatas"])
     for did, doc, meta in zip(
         doc_result.get("ids") or [],
         doc_result.get("documents") or [],

@@ -1,14 +1,13 @@
-"""Tests for the ``mempalace read`` CLI verb (Task #87).
+"""Tests for the ``mempalace read`` CLI verb.
 
 The verb consumes a closet pointer (or a shorthand date+line+source) and
 returns the surgical line-range slice from the referenced drawer(s).
 Resurrects the original ``read.py`` concept Aya designed with Lumi —
 opening only the slice the closet pointer matched, never the whole
-drawer. See ~/.claude/projects/-Users-ilp-Lantern-Planning/memory/
-identity_cedar.md for the Opsi-era context.
+drawer.
 
-Tests are negative-first per /negative-tests discipline — failure
-contract is pinned BEFORE the happy-path positives.
+Tests are negative-first — the failure contract is pinned BEFORE the
+happy-path positives.
 """
 
 from unittest.mock import MagicMock
@@ -139,13 +138,16 @@ class TestParsePointer:
 
 
 def _fake_collection(drawers_by_id):
-    """Build a MagicMock collection whose .get(ids=...) returns matching records.
+    """Build a MagicMock collection whose .get supports the patterns
+    used in ``reader.py``: by-id, by-where, and paginated full-scan via
+    ``limit``+``offset``. ``col.count()`` returns the total drawer count.
 
     ``drawers_by_id`` is a dict {drawer_id: {"document": ..., "metadata": ...}}.
     """
     col = MagicMock()
+    col.count.return_value = len(drawers_by_id)
 
-    def fake_get(ids=None, where=None, include=None, **kwargs):
+    def fake_get(ids=None, where=None, include=None, limit=None, offset=None, **kwargs):
         if ids is not None:
             found_ids = []
             found_docs = []
@@ -168,12 +170,15 @@ def _fake_collection(drawers_by_id):
                     docs_out.append(rec["document"])
                     metas_out.append(rec["metadata"])
             return {"ids": ids_out, "documents": docs_out, "metadatas": metas_out}
-        # Fall through — return all
-        ids_out = list(drawers_by_id.keys())
+        # Paginated full scan: honor limit/offset over the dict's insertion order.
+        all_ids = list(drawers_by_id.keys())
+        start = offset or 0
+        end = start + limit if limit is not None else len(all_ids)
+        slice_ids = all_ids[start:end]
         return {
-            "ids": ids_out,
-            "documents": [drawers_by_id[d]["document"] for d in ids_out],
-            "metadatas": [drawers_by_id[d]["metadata"] for d in ids_out],
+            "ids": slice_ids,
+            "documents": [drawers_by_id[d]["document"] for d in slice_ids],
+            "metadatas": [drawers_by_id[d]["metadata"] for d in slice_ids],
         }
 
     col.get.side_effect = fake_get
@@ -433,29 +438,27 @@ class TestReadSlice:
 
 
 class TestResolveBySourceTwoStepFetch:
-    """Fallback scan must fetch metadatas first, then fetch documents only
-    for matched IDs. Pre-fix, the scan fetched all documents up front —
-    O(N) memory bloat on large palaces.
+    """Fallback scan must paginate metadatas-only, then chunked-fetch
+    documents only for matched IDs. The contract is asserted against
+    the actual call shape produced by the new paginated + chunked
+    implementation (mirrors palace.bulk_check_mined for the scan +
+    _chunked_get for the docs).
     """
 
-    def test_fallback_scan_does_not_include_documents_in_first_fetch(self):
-        from unittest.mock import MagicMock
+    def test_metadata_scan_calls_do_not_include_documents(self):
+        """Every paginated scan call (col.get with offset=N, no ids=)
+        must NOT request 'documents' — that's the whole point of the
+        two-step pattern."""
         from mempalace.reader import ParsedPointer, resolve_drawers
 
-        col = MagicMock()
-        col.get.side_effect = [
-            {"ids": [], "documents": [], "metadatas": []},
+        col = _fake_collection(
             {
-                "ids": ["d1"],
-                "documents": None,
-                "metadatas": [{"source_file": "/proj/chat.md", "chunk_index": 0}],
-            },
-            {
-                "ids": ["d1"],
-                "documents": ["chunk content"],
-                "metadatas": [{"source_file": "/proj/chat.md", "chunk_index": 0}],
-            },
-        ]
+                "d1": {
+                    "document": "chunk content",
+                    "metadata": {"source_file": "/proj/chat.md", "chunk_index": 0},
+                },
+            }
+        )
         parsed = ParsedPointer(
             date=None,
             line_start=None,
@@ -465,38 +468,41 @@ class TestResolveBySourceTwoStepFetch:
         )
         resolve_drawers(col, parsed)
 
-        assert col.get.call_count >= 2
-        scan_kwargs = col.get.call_args_list[1].kwargs
-        include = scan_kwargs.get("include", [])
-        assert "documents" not in include, (
-            f"fallback scan must NOT request documents; got include={include!r}"
-        )
-        assert "metadatas" in include
+        # Inspect every scan-shape call (no `ids=`, no `where=`, has offset/limit).
+        scan_calls = [
+            c
+            for c in col.get.call_args_list
+            if c.kwargs.get("ids") is None and c.kwargs.get("where") is None
+        ]
+        assert scan_calls, "expected at least one paginated scan call"
+        for c in scan_calls:
+            include = c.kwargs.get("include", [])
+            assert "documents" not in include, (
+                f"scan call must NOT request documents; got include={include!r}"
+            )
+            assert "metadatas" in include
 
-    def test_fallback_fetches_documents_only_for_matched_ids(self):
-        from unittest.mock import MagicMock
+    def test_docs_fetch_requests_only_matched_ids(self):
+        """The chunked docs-fetch (col.get with ids=...) must request
+        only the IDs whose metadata matched, never the non-matching ones."""
         from mempalace.reader import ParsedPointer, resolve_drawers
 
-        col = MagicMock()
-        col.get.side_effect = [
-            {"ids": [], "documents": [], "metadatas": []},
+        col = _fake_collection(
             {
-                "ids": ["d1", "d2", "d3"],
-                "metadatas": [
-                    {"source_file": "/proj/match.md", "chunk_index": 0},
-                    {"source_file": "/proj/other.md", "chunk_index": 0},
-                    {"source_file": "/proj/match.md", "chunk_index": 1},
-                ],
-            },
-            {
-                "ids": ["d1", "d3"],
-                "documents": ["chunk 0", "chunk 1"],
-                "metadatas": [
-                    {"source_file": "/proj/match.md", "chunk_index": 0},
-                    {"source_file": "/proj/match.md", "chunk_index": 1},
-                ],
-            },
-        ]
+                "d1": {
+                    "document": "match chunk 0",
+                    "metadata": {"source_file": "/proj/match.md", "chunk_index": 0},
+                },
+                "d2": {
+                    "document": "other content",
+                    "metadata": {"source_file": "/proj/other.md", "chunk_index": 0},
+                },
+                "d3": {
+                    "document": "match chunk 1",
+                    "metadata": {"source_file": "/proj/match.md", "chunk_index": 1},
+                },
+            }
+        )
         parsed = ParsedPointer(
             date=None,
             line_start=None,
@@ -506,28 +512,36 @@ class TestResolveBySourceTwoStepFetch:
         )
         result = resolve_drawers(col, parsed)
 
-        assert col.get.call_count == 3
-        docs_kwargs = col.get.call_args_list[2].kwargs
-        requested_ids = docs_kwargs.get("ids", [])
-        assert set(requested_ids) == {"d1", "d3"}, (
-            f"docs-fetch must request only matched IDs; got {requested_ids!r}"
+        # Identify the docs-fetch calls (col.get with ids=).
+        docs_calls = [c for c in col.get.call_args_list if c.kwargs.get("ids") is not None]
+        assert docs_calls, "expected at least one docs-fetch call"
+        # Aggregate all IDs requested across chunks.
+        all_requested = set()
+        for c in docs_calls:
+            for did in c.kwargs.get("ids") or []:
+                all_requested.add(did)
+            assert "documents" in c.kwargs.get("include", []), (
+                "docs-fetch call must request documents"
+            )
+        assert all_requested == {"d1", "d3"}, (
+            f"docs-fetch must request only matched IDs (d1, d3); got {all_requested!r}"
         )
-        assert "documents" in docs_kwargs.get("include", [])
         assert len(result) == 2
         assert [c.chunk_index for c in result] == [0, 1]
 
-    def test_fallback_skips_documents_fetch_when_no_matches(self):
-        from unittest.mock import MagicMock
+    def test_no_docs_fetch_when_no_basename_matches(self):
+        """When the metadata scan finds zero matches, we must NOT issue
+        any docs-fetch (col.get with ids=). Saves a pointless I/O."""
         from mempalace.reader import ParsedPointer, resolve_drawers
 
-        col = MagicMock()
-        col.get.side_effect = [
-            {"ids": [], "documents": [], "metadatas": []},
+        col = _fake_collection(
             {
-                "ids": ["d1"],
-                "metadatas": [{"source_file": "/proj/different.md", "chunk_index": 0}],
-            },
-        ]
+                "d1": {
+                    "document": "irrelevant",
+                    "metadata": {"source_file": "/proj/different.md", "chunk_index": 0},
+                },
+            }
+        )
         parsed = ParsedPointer(
             date=None,
             line_start=None,
@@ -537,8 +551,9 @@ class TestResolveBySourceTwoStepFetch:
         )
         result = resolve_drawers(col, parsed)
         assert result == []
-        assert col.get.call_count == 2, (
-            f"expected 2 calls (no documents fetch on zero matches); got {col.get.call_count}"
+        docs_calls = [c for c in col.get.call_args_list if c.kwargs.get("ids") is not None]
+        assert docs_calls == [], (
+            f"no docs-fetch should happen on zero matches; got {len(docs_calls)} calls"
         )
 
 
@@ -798,3 +813,255 @@ class TestCmdReadThreadsLineRange:
                     f"--all call #{i} must pass line_start=10; got {line_start!r}"
                 )
                 assert line_end == 20, f"--all call #{i} must pass line_end=20; got {line_end!r}"
+
+
+# Gemini PR #1588 re-review fixes (chunking + pagination + Igor items)
+
+
+class TestChunkedGet:
+    """gemini HIGH-priority + fresh-Claude V3 plan #1.
+
+    ``_chunked_get(col, ids, include, batch=500)`` splits an arbitrarily
+    long ID list into ``col.get`` calls of at most ``batch`` IDs each,
+    then merges the results. This avoids ``sqlite3.OperationalError:
+    too many SQL variables`` on the SQLite-backed ChromaDB store, whose
+    ``SQLITE_MAX_VARIABLE_NUMBER`` default is 999.
+    """
+
+    def test_empty_input_returns_empty_dict_with_no_calls(self):
+        from unittest.mock import MagicMock
+        from mempalace.reader import _chunked_get
+
+        col = MagicMock()
+        result = _chunked_get(col, [], include=["documents", "metadatas"])
+        assert result == {"ids": [], "documents": [], "metadatas": []}
+        assert col.get.call_count == 0, "empty input must NOT call col.get"
+
+    def test_single_chunk_when_input_below_batch_size(self):
+        from unittest.mock import MagicMock
+        from mempalace.reader import _chunked_get
+
+        col = MagicMock()
+        col.get.return_value = {
+            "ids": ["a", "b", "c"],
+            "documents": ["doc_a", "doc_b", "doc_c"],
+            "metadatas": [{"x": 1}, {"x": 2}, {"x": 3}],
+        }
+        result = _chunked_get(col, ["a", "b", "c"], include=["documents", "metadatas"])
+        assert col.get.call_count == 1
+        assert result["ids"] == ["a", "b", "c"]
+        assert result["documents"] == ["doc_a", "doc_b", "doc_c"]
+        assert result["metadatas"] == [{"x": 1}, {"x": 2}, {"x": 3}]
+
+    def test_chunks_input_larger_than_batch_into_multiple_calls(self):
+        """1500 IDs with batch=500 must produce 3 col.get calls of 500 each."""
+        from unittest.mock import MagicMock
+        from mempalace.reader import _chunked_get
+
+        col = MagicMock()
+
+        def fake_get(ids, include):
+            return {
+                "ids": list(ids),
+                "documents": [f"doc_{i}" for i in ids],
+                "metadatas": [{"i": i} for i in ids],
+            }
+
+        col.get.side_effect = fake_get
+
+        big_ids = [f"id_{i}" for i in range(1500)]
+        result = _chunked_get(col, big_ids, include=["documents", "metadatas"], batch=500)
+
+        assert col.get.call_count == 3, (
+            f"1500 IDs / batch=500 must produce 3 calls; got {col.get.call_count}"
+        )
+        for i, call in enumerate(col.get.call_args_list):
+            chunk = call.kwargs.get("ids") or call.args[0]
+            assert len(chunk) == 500, f"call #{i}: expected 500 IDs, got {len(chunk)}"
+
+        # Aggregation: all 1500 IDs in the merged result, in chunk order.
+        assert len(result["ids"]) == 1500
+        assert result["ids"] == big_ids
+        assert len(result["documents"]) == 1500
+        assert len(result["metadatas"]) == 1500
+
+    def test_chunks_input_with_partial_last_batch(self):
+        """1200 IDs with batch=500 → 500 + 500 + 200."""
+        from unittest.mock import MagicMock
+        from mempalace.reader import _chunked_get
+
+        col = MagicMock()
+
+        def fake_get(ids, include):
+            return {
+                "ids": list(ids),
+                "documents": [f"doc_{i}" for i in ids],
+                "metadatas": [{"i": i} for i in ids],
+            }
+
+        col.get.side_effect = fake_get
+        result = _chunked_get(
+            col, [f"id_{i}" for i in range(1200)], include=["documents", "metadatas"], batch=500
+        )
+        assert col.get.call_count == 3
+        sizes = [len(call.kwargs.get("ids") or call.args[0]) for call in col.get.call_args_list]
+        assert sizes == [500, 500, 200]
+        assert len(result["ids"]) == 1200
+
+
+class TestCmdReadCLISubprocess:
+    """End-to-end smoke tests that mine a tiny fixture and shell out
+    to ``mempalace read``. The unit suite can pass while the headline
+    feature is broken (e.g., the verb returns a whole chunk instead
+    of the requested line range) because the CLI wiring is untested
+    by mocks alone. These subprocess tests close that gap.
+    """
+
+    def test_read_with_line_range_returns_only_requested_lines(self, tmp_path):
+        """Mine a 12-line file. ``mempalace read "<date>:L3-L7 chat.md"``
+        must return lines [3] through [7] only — no [1] [2] [8] [9] etc."""
+        import subprocess
+        import sys
+
+        # Build a tiny source corpus.
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        (src_dir / "chat.md").write_text(
+            "\n".join(
+                [
+                    "line 1 — hello",
+                    "line 2 — world",
+                    "line 3 — alpha",
+                    "line 4 — beta",
+                    "line 5 — gamma",
+                    "line 6 — delta",
+                    "line 7 — epsilon",
+                    "line 8 — zeta",
+                    "line 9 — eta",
+                    "line 10 — theta",
+                    "line 11 — iota",
+                    "line 12 — kappa",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        palace = tmp_path / "palace"
+
+        # Mine the fixture. Allow generous timeout: cold-cache invocations
+        # download a ~79 MB ONNX embedding model on first run.
+        mine = subprocess.run(
+            [sys.executable, "-m", "mempalace", "--palace", str(palace), "mine", str(src_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+        assert mine.returncode == 0, f"mine failed: {mine.stderr}"
+
+        # Run the verb under test.
+        read = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mempalace",
+                "--palace",
+                str(palace),
+                "read",
+                "2024-11-08:L3-L7 chat.md",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        assert read.returncode == 0, f"read failed: {read.stderr}"
+        # Surgical slice contract: ONLY lines [3] through [7].
+        assert "[3] line 3 — alpha" in read.stdout
+        assert "[7] line 7 — epsilon" in read.stdout
+        # Hard negative: leaked lines outside the range would prove the
+        # whole-chunk-leak bug Igor caught is back.
+        assert "[1]" not in read.stdout, (
+            f"unexpected leak of line 1; whole-chunk regression?\nstdout:\n{read.stdout}"
+        )
+        assert "[2]" not in read.stdout
+        assert "[8]" not in read.stdout
+        assert "[10]" not in read.stdout
+        assert "[12]" not in read.stdout
+
+    def test_read_garbage_pointer_exits_with_clear_error(self, tmp_path):
+        """A malformed pointer must produce a clear stderr message and
+        a non-zero exit code (not a traceback)."""
+        import subprocess
+        import sys
+
+        palace = tmp_path / "palace"
+        palace.mkdir()
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mempalace",
+                "--palace",
+                str(palace),
+                "read",
+                "totally not a pointer",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        assert result.returncode != 0, (
+            f"garbage pointer should exit non-zero; got {result.returncode}"
+        )
+        # Either the parser or the palace-open path should produce a
+        # clear human-readable error, not a traceback.
+        assert "Traceback" not in result.stderr
+        assert (
+            "could not parse" in result.stderr.lower()
+            or "no drawers found" in result.stderr.lower()
+            or "palace" in result.stderr.lower()
+        )
+
+    def test_read_help_shows_mutually_exclusive_drawer_all(self):
+        """argparse must surface the --drawer/--all mutex group in
+        ``read --help`` (Igor's optional-polish item)."""
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "mempalace", "read", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        assert result.returncode == 0
+        # Both flags must appear in --help output. The exact layout of
+        # mutex groups varies by terminal width; the load-bearing
+        # contract is enforced via the rejected-combo check below.
+        assert "--drawer" in result.stdout
+        assert "--all" in result.stdout
+        # Verify mutex enforcement: passing both must fail at parse time.
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mempalace",
+                "read",
+                "--drawer",
+                "1",
+                "--all",
+                "dummy_pointer",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        assert rejected.returncode != 0, "argparse should reject --drawer + --all combo"
+        assert (
+            "not allowed with" in rejected.stderr
+            or "argument --all" in rejected.stderr
+            or "mutually exclusive" in rejected.stderr.lower()
+        ), f"argparse must surface the mutex constraint; got stderr={rejected.stderr!r}"

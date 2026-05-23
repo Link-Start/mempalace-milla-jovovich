@@ -716,12 +716,6 @@ def cmd_read(args):
                 'Example: mempalace read "2024-11-08:L42-L78 file.md"',
                 file=sys.stderr,
             )
-    if pointer is None or pointer == "-":
-        if sys.stdin.isatty():
-            print(
-                "Error: no pointer provided. Pass as argument or pipe via stdin.",
-                file=sys.stderr,
-            )
             sys.exit(1)
         pointer = sys.stdin.read().strip()
     if not pointer:
@@ -729,11 +723,6 @@ def cmd_read(args):
             "Error: no pointer provided. Pass as argument or pipe via stdin.",
             file=sys.stderr,
         )
-        sys.exit(1)
-
-    # Reject mutually exclusive flags upfront.
-    if args.drawer is not None and args.all:
-        print("Error: --drawer and --all are mutually exclusive.", file=sys.stderr)
         sys.exit(1)
 
     # Parse the pointer.
@@ -1545,13 +1534,18 @@ def main():
             "'topic|entities|2024-11-08:L42-L78|→drawer_a,drawer_b'."
         ),
     )
-    p_read.add_argument(
+    # ``--drawer N`` and ``--all`` are mutually exclusive. Registering
+    # them in an argparse exclusive group surfaces the constraint in
+    # ``mempalace read --help`` and rejects the bad combination at
+    # parse time, before ``cmd_read`` runs.
+    p_read_picker = p_read.add_mutually_exclusive_group()
+    p_read_picker.add_argument(
         "--drawer",
         type=int,
         default=None,
         help="When the pointer matches multiple drawers, pick the N-th (1-indexed) non-interactively.",
     )
-    p_read.add_argument(
+    p_read_picker.add_argument(
         "--all",
         action="store_true",
         help="Read every drawer the pointer matches, concatenated with separators.",
