@@ -750,13 +750,19 @@ def cmd_read(args):
         print("Error: no drawers found for this pointer.", file=sys.stderr)
         sys.exit(1)
 
+    # Thread the parsed line range through every read_slice call —
+    # without it, the verb returns whole chunks instead of the
+    # requested surgical slice. Igor blocker on PR #1588.
+    ls = parsed.line_start
+    le = parsed.line_end
+
     # Single drawer or --all flag: render directly, no prompt.
     if len(candidates) == 1 and not args.all:
-        print(read_slice(candidates[0]))
+        print(read_slice(candidates[0], requested_line_start=ls, requested_line_end=le))
         return
 
     if args.all:
-        _print_all_candidates(candidates)
+        _print_all_candidates(candidates, ls, le)
         return
 
     # Non-interactive --drawer N selection.
@@ -768,7 +774,7 @@ def cmd_read(args):
                 file=sys.stderr,
             )
             sys.exit(1)
-        print(read_slice(candidates[idx - 1]))
+        print(read_slice(candidates[idx - 1], requested_line_start=ls, requested_line_end=le))
         return
 
     # Interactive picker.
@@ -781,7 +787,7 @@ def cmd_read(args):
         sys.exit(130)
 
     if choice.lower() == "all":
-        _print_all_candidates(candidates)
+        _print_all_candidates(candidates, ls, le)
         return
     try:
         idx = int(choice)
@@ -794,18 +800,28 @@ def cmd_read(args):
             file=sys.stderr,
         )
         sys.exit(1)
-    print(read_slice(candidates[idx - 1]))
+    print(read_slice(candidates[idx - 1], requested_line_start=ls, requested_line_end=le))
 
 
-def _print_all_candidates(candidates):
-    """Concatenate all candidates' slices with a separator between them."""
+def _print_all_candidates(candidates, requested_line_start=None, requested_line_end=None):
+    """Concatenate all candidates' slices with a separator between them.
+
+    Accepts and forwards the requested line range so every candidate
+    renders the surgical slice, not the whole chunk.
+    """
     from .reader import read_slice
 
     for i, cand in enumerate(candidates, start=1):
         if i > 1:
             print()
         print(f"─── [{i}] chunk {cand.chunk_index} " + "─" * 30)
-        print(read_slice(cand))
+        print(
+            read_slice(
+                cand,
+                requested_line_start=requested_line_start,
+                requested_line_end=requested_line_end,
+            )
+        )
 
 
 def cmd_wakeup(args):

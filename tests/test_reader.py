@@ -620,3 +620,181 @@ class TestTypeAnnotations:
         assert "DrawerCandidate" in ann_str, (
             f"resolve_drawers must return list[DrawerCandidate]; got {ann_str!r}"
         )
+
+
+class TestCmdReadThreadsLineRange:
+    """Igor's blocker on PR #1588 (cli.py:755): cmd_read called
+    ``read_slice(candidates[0])`` with NO line range — so
+    ``parsed.line_start`` / ``parsed.line_end`` (the entire point of
+    'surgical slice') were dropped on the floor and the whole chunk
+    came back.
+
+    These tests pin the contract: every code path in cmd_read that
+    calls read_slice MUST forward parsed.line_start and parsed.line_end.
+    """
+
+    def _make_candidates(self, n=1):
+        from mempalace.reader import DrawerCandidate
+
+        return [
+            DrawerCandidate(
+                drawer_id=f"d{i}",
+                source_file="/p/chat.md",
+                chunk_index=i,
+                line_start=1,
+                line_end=100,
+                document="x" * 50,
+            )
+            for i in range(n)
+        ]
+
+    def _patch_cmd_read_deps(self, candidates, parsed):
+        """Patch the open_collection + resolve_drawers + parse_pointer
+        chain so cmd_read can be invoked in isolation."""
+        from unittest.mock import patch, MagicMock
+
+        return [
+            patch("mempalace.palace._open_collection_or_explain", return_value=MagicMock()),
+            patch("mempalace.reader.parse_pointer", return_value=parsed),
+            patch("mempalace.reader.resolve_drawers", return_value=candidates),
+        ]
+
+    def test_single_candidate_path_passes_line_range(self):
+        """``len(candidates) == 1 and not args.all`` path — cli.py:755."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from mempalace.cli import cmd_read
+        from mempalace.reader import ParsedPointer
+
+        parsed = ParsedPointer(
+            date="2024-11-08",
+            line_start=1,
+            line_end=3,
+            source_file="chat.md",
+            drawer_ids=[],
+        )
+        candidates = self._make_candidates(1)
+        args = SimpleNamespace(
+            pointer="2024-11-08:L1-L3 chat.md",
+            drawer=None,
+            all=False,
+            palace=None,
+        )
+        patches = self._patch_cmd_read_deps(candidates, parsed)
+        with patch("mempalace.reader.read_slice") as mock_read_slice:
+            mock_read_slice.return_value = "stub output"
+            for p in patches:
+                p.start()
+            try:
+                cmd_read(args)
+            finally:
+                for p in patches:
+                    p.stop()
+            mock_read_slice.assert_called_once()
+            call_args = mock_read_slice.call_args
+            # Accept either positional or keyword form.
+            kwargs = call_args.kwargs
+            positional = call_args.args
+            line_start = kwargs.get(
+                "requested_line_start", positional[1] if len(positional) > 1 else None
+            )
+            line_end = kwargs.get(
+                "requested_line_end", positional[2] if len(positional) > 2 else None
+            )
+            assert line_start == 1, (
+                f"single-candidate path must pass line_start=1; got {line_start!r}"
+            )
+            assert line_end == 3, f"single-candidate path must pass line_end=3; got {line_end!r}"
+
+    def test_drawer_flag_path_passes_line_range(self):
+        """``--drawer N`` non-interactive path — cli.py:771."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from mempalace.cli import cmd_read
+        from mempalace.reader import ParsedPointer
+
+        parsed = ParsedPointer(
+            date="2024-11-08",
+            line_start=5,
+            line_end=7,
+            source_file="chat.md",
+            drawer_ids=[],
+        )
+        candidates = self._make_candidates(3)
+        args = SimpleNamespace(
+            pointer="2024-11-08:L5-L7 chat.md",
+            drawer=2,
+            all=False,
+            palace=None,
+        )
+        patches = self._patch_cmd_read_deps(candidates, parsed)
+        with patch("mempalace.reader.read_slice") as mock_read_slice:
+            mock_read_slice.return_value = "stub output"
+            for p in patches:
+                p.start()
+            try:
+                cmd_read(args)
+            finally:
+                for p in patches:
+                    p.stop()
+            mock_read_slice.assert_called_once()
+            kwargs = mock_read_slice.call_args.kwargs
+            positional = mock_read_slice.call_args.args
+            line_start = kwargs.get(
+                "requested_line_start", positional[1] if len(positional) > 1 else None
+            )
+            line_end = kwargs.get(
+                "requested_line_end", positional[2] if len(positional) > 2 else None
+            )
+            assert line_start == 5, f"--drawer path must pass line_start=5; got {line_start!r}"
+            assert line_end == 7, f"--drawer path must pass line_end=7; got {line_end!r}"
+
+    def test_all_flag_path_passes_line_range_to_each_candidate(self):
+        """``--all`` path — cli.py:759 (calls _print_all_candidates which
+        loops over read_slice). Helper must accept and forward parsed
+        line range to every candidate."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from mempalace.cli import cmd_read
+        from mempalace.reader import ParsedPointer
+
+        parsed = ParsedPointer(
+            date="2024-11-08",
+            line_start=10,
+            line_end=20,
+            source_file="chat.md",
+            drawer_ids=[],
+        )
+        candidates = self._make_candidates(3)
+        args = SimpleNamespace(
+            pointer="2024-11-08:L10-L20 chat.md",
+            drawer=None,
+            all=True,
+            palace=None,
+        )
+        patches = self._patch_cmd_read_deps(candidates, parsed)
+        with patch("mempalace.reader.read_slice") as mock_read_slice:
+            mock_read_slice.return_value = "stub output"
+            for p in patches:
+                p.start()
+            try:
+                cmd_read(args)
+            finally:
+                for p in patches:
+                    p.stop()
+            assert mock_read_slice.call_count == 3, (
+                f"--all must call read_slice once per candidate; got {mock_read_slice.call_count}"
+            )
+            for i, call in enumerate(mock_read_slice.call_args_list):
+                kwargs = call.kwargs
+                positional = call.args
+                line_start = kwargs.get(
+                    "requested_line_start", positional[1] if len(positional) > 1 else None
+                )
+                line_end = kwargs.get(
+                    "requested_line_end", positional[2] if len(positional) > 2 else None
+                )
+                assert line_start == 10, (
+                    f"--all call #{i} must pass line_start=10; got {line_start!r}"
+                )
+                assert line_end == 20, f"--all call #{i} must pass line_end=20; got {line_end!r}"
