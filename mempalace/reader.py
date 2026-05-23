@@ -332,7 +332,7 @@ def format_drawer_menu(candidates: list[DrawerCandidate]) -> str:
     if not candidates:
         return "No drawers to show.\n"
 
-    lines: list = []
+    lines: list[str] = []
 
     # Single source file across the closet pointer (true by construction —
     # build_closet_lines is per-source). Show it once at the top.
