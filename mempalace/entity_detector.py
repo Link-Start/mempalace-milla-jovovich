@@ -93,14 +93,17 @@ def _get_coca_filter() -> frozenset[str]:
 
 
 @functools.lru_cache(maxsize=1)
-def _get_known_systems() -> tuple[str, ...]:
-    """Return the known-systems compound tuple (canonical case preserved).
+def _get_known_systems() -> tuple[tuple[str, "re.Pattern[str]"], ...]:
+    """Return the known-systems compound tuple — pairs of (canonical name,
+    pre-compiled case-insensitive word-bounded regex).
 
-    Loads ``mempalace/data/known_systems.json`` on first call and caches
-    the result as a tuple. Subsequent calls are O(1). Returns an empty
-    tuple if the data file is missing or malformed — extraction behavior
-    then degrades gracefully (compounds detected only by the existing
-    multi-word regex) rather than crashing.
+    Loads ``mempalace/data/known_systems.json`` on first call, compiles a
+    regex for each valid compound, and caches the resulting tuple of
+    pairs. Subsequent calls are O(1) and skip both the disk read AND the
+    regex compilation. Returns an empty tuple if the data file is missing
+    or malformed — extraction behavior then degrades gracefully
+    (compounds detected only by the existing multi-word regex) rather
+    than crashing.
 
     Entries are sorted by length descending so the compound matcher
     prefers longer matches first (e.g. "Visual Studio Code" wins over
@@ -114,7 +117,20 @@ def _get_known_systems() -> tuple[str, ...]:
         # Sort by length descending so longest-match-wins during the
         # pre-pass scan (longer compounds get masked first, so a shorter
         # compound contained within a longer one doesn't double-count).
-        return tuple(sorted(valid, key=len, reverse=True))
+        sorted_compounds = sorted(valid, key=len, reverse=True)
+
+        compiled: list[tuple[str, re.Pattern[str]]] = []
+        for c in sorted_compounds:
+            # Word-boundary, case-insensitive. Compound may contain
+            # hyphens or spaces — re.escape handles special chars; word
+            # boundaries on each side prevent partial-word matches
+            # (e.g. "GPT-4" must not match "GPT-40").
+            pattern = r"(?<!\w)" + re.escape(c) + r"(?!\w)"
+            try:
+                compiled.append((c, re.compile(pattern, re.IGNORECASE)))
+            except re.error:
+                continue
+        return tuple(compiled)
     except (OSError, json.JSONDecodeError, AttributeError, TypeError):
         return ()
 
@@ -132,23 +148,15 @@ def _apply_known_systems_prepass(text: str) -> tuple[str, dict[str, int]]:
 
     Compounds are matched case-insensitively with word boundaries; the
     canonical (lexicon) casing is what gets counted, regardless of how
-    the compound appears in the source text.
+    the compound appears in the source text. Regexes are pre-compiled
+    once in ``_get_known_systems`` so this function does no compilation.
     """
     compounds = _get_known_systems()
     if not compounds:
         return text, {}
     working = text
     compound_counts: dict[str, int] = {}
-    for compound in compounds:
-        # Word-boundary, case-insensitive. Compound may contain hyphens or
-        # spaces — re.escape handles special chars; word boundaries on each
-        # side prevent partial-word matches (e.g. "GPT-4" must not match
-        # "GPT-40").
-        pattern = r"(?<!\w)" + re.escape(compound) + r"(?!\w)"
-        try:
-            rx = re.compile(pattern, re.IGNORECASE)
-        except re.error:
-            continue
+    for compound, rx in compounds:
         matches = list(rx.finditer(working))
         if not matches:
             continue
