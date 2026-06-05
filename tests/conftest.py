@@ -33,6 +33,68 @@ import pytest  # noqa: E402
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
+# Redirect ChromaDB's ONNX model cache back to the real user's cache so tests
+# don't re-download the 79 MB model on every run. The HOME redirect above
+# would otherwise point ONNXMiniLM_L6_V2.DOWNLOAD_PATH at the empty temp dir.
+try:
+    from pathlib import Path  # noqa: E402
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (  # noqa: E402
+        ONNXMiniLM_L6_V2,
+    )
+
+    _real_home = _original_env.get("USERPROFILE") or _original_env.get("HOME")
+    if _real_home:
+        _real_cache = Path(_real_home) / ".cache" / "chroma" / "onnx_models" / "all-MiniLM-L6-v2"
+        if _real_cache.exists():
+            ONNXMiniLM_L6_V2.DOWNLOAD_PATH = _real_cache
+except ImportError:
+    pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_mcp_cache():
+    """Reset cached MCP state between tests without importing mcp_server.
+
+    If mempalace.mcp_server is already imported, close/clear its KG cache and
+    Chroma client cache. If it has not been imported, leave it unloaded so
+    fork/spawn-based tests do not inherit extra Chroma/SQLite state.
+    """
+
+    def _clear_cache():
+        try:
+            import sys
+
+            mcp_server = sys.modules.get("mempalace.mcp_server")
+            if mcp_server is not None:
+                for kg in list(getattr(mcp_server, "_kg_by_path", {}).values()):
+                    close = getattr(kg, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                if hasattr(mcp_server, "_kg_by_path"):
+                    mcp_server._kg_by_path.clear()
+
+                mcp_server._client_cache = None
+                mcp_server._collection_cache = None
+        except AttributeError:
+            pass
+
+        try:
+            # Reset the per-process quarantine gate so tests don't leak
+            # state through ChromaBackend._quarantined_paths.
+            from mempalace.backends.chroma import ChromaBackend
+
+            ChromaBackend._quarantined_paths.clear()
+        except (ImportError, AttributeError):
+            pass
+
+    _clear_cache()
+    yield
+    _clear_cache()
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_home():
@@ -83,8 +145,10 @@ def config(tmp_dir, palace_path):
 def collection(palace_path):
     """A ChromaDB collection pre-seeded in the temp palace."""
     client = chromadb.PersistentClient(path=palace_path)
-    col = client.get_or_create_collection("mempalace_drawers")
-    return col
+    col = client.get_or_create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
+    yield col
+    client.delete_collection("mempalace_drawers")
+    del client
 
 
 @pytest.fixture
@@ -149,7 +213,9 @@ def seeded_collection(collection):
 def kg(tmp_dir):
     """An isolated KnowledgeGraph using a temp SQLite file."""
     db_path = os.path.join(tmp_dir, "test_kg.sqlite3")
-    return KnowledgeGraph(db_path=db_path)
+    graph = KnowledgeGraph(db_path=db_path)
+    yield graph
+    graph.close()
 
 
 @pytest.fixture
