@@ -2,10 +2,10 @@ name: Publish to PyPI
 
 # Publishes mempalace to PyPI via Trusted Publishing (OIDC — no stored token).
 #
-# Trigger: a GitHub Release is *published* (not merely drafted). Creating the
-# Release also creates the `v*` tag, so the usual version-guard.yml runs in
-# parallel; the checks below are duplicated here on purpose so this pipeline is
-# self-contained and never uploads on a tag that version-guard didn't gate.
+# Trigger: a GitHub Release is *published* (not merely drafted). The release may
+# create the `v*` tag or be cut from an existing one — either way the checks
+# below run here on purpose, so this pipeline is self-contained and never
+# uploads a tag that isn't on main or doesn't match the version manifest.
 #
 # One-time setup required before the first run (see docs/RELEASING.md):
 #   1. PyPI → Manage project `mempalace` → Publishing → Add a trusted publisher:
