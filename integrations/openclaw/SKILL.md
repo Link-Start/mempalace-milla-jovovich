@@ -1,7 +1,7 @@
 ---
 name: mempalace
 description: "MemPalace — Local AI memory with 96.6% recall. Semantic search, temporal knowledge graph, palace architecture (wings/rooms/drawers). Free, no cloud, no API keys."
-version: 3.3.0
+version: 3.4.0
 homepage: https://github.com/MemPalace/mempalace
 user-invocable: true
 metadata:
@@ -58,6 +58,12 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 - `mempalace_status` — Palace overview: total drawers, wings, rooms, AAAK spec
 - `mempalace_list_wings` — All wings with drawer counts
 - `mempalace_list_rooms` — Rooms within a wing (optional wing filter)
+- `mempalace_list_drawers` — Paginated drawer listing
+  - `wing`, `room`: optional filters
+  - `limit`: max results (default 20)
+  - `offset`: pagination offset (default 0)
+- `mempalace_get_drawer` — Fetch a single drawer by ID. Returns full verbatim content and metadata.
+  - `drawer_id` (required)
 - `mempalace_get_taxonomy` — Full wing/room/count tree
 - `mempalace_get_aaak_spec` — Get AAAK compression dialect specification
 
@@ -81,8 +87,18 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 - `mempalace_traverse` — Walk from a room, find connected ideas across wings
   - `start_room` (required): room to start from
   - `max_hops`: connection depth (default 2)
-- `mempalace_find_tunnels` — Find rooms that bridge two wings
+- `mempalace_find_tunnels` — Find rooms that bridge two wings (implicit overlap)
   - `wing_a`, `wing_b` (required)
+- `mempalace_create_tunnel` — Create an EXPLICIT cross-wing tunnel between two locations. Use when you notice content in one project relates to another (e.g. API design in `project_api` connects to schema in `project_database`).
+  - `source_wing`, `source_room`, `target_wing`, `target_room` (required)
+  - `label`: short description of the relationship
+  - `source_drawer_id`, `target_drawer_id`: anchor to specific drawers
+- `mempalace_list_tunnels` — List all explicit tunnels, optionally filtered by wing
+  - `wing`: optional filter
+- `mempalace_delete_tunnel` — Remove an explicit tunnel by ID
+  - `tunnel_id` (required)
+- `mempalace_follow_tunnels` — From a room, follow explicit tunnels to connected drawers in other wings
+  - `wing`, `room` (required)
 - `mempalace_graph_stats` — Graph connectivity overview
 
 ### Write
@@ -90,6 +106,9 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
   - `wing`, `room`, `content` (required)
   - `source_file`: optional source reference
   - Checks for duplicates automatically
+- `mempalace_update_drawer` — Update an existing drawer's content and/or move it to a different wing/room
+  - `drawer_id` (required)
+  - `content`, `wing`, `room`: at least one must be provided (no-op otherwise)
 - `mempalace_delete_drawer` — Remove a drawer by ID
   - `drawer_id` (required)
 - `mempalace_diary_write` — Write a session diary entry
@@ -99,6 +118,7 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 - `mempalace_diary_read` — Read recent diary entries
   - `agent_name` (required)
   - `last_n`: number of entries (default 10)
+- `mempalace_memories_filed_away` — Acknowledge the latest silent auto-save checkpoint and report how many messages were tucked into drawers. Call at the START of a session to confirm prior-conversation persistence.
 
 ## Setup
 
