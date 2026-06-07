@@ -87,9 +87,9 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 - `mempalace_traverse` — Walk from a room, find connected ideas across wings
   - `start_room` (required): room to start from
   - `max_hops`: connection depth (default 2)
-- `mempalace_find_tunnels` — Find rooms that bridge two wings (implicit overlap)
-  - `wing_a`, `wing_b` (required)
-- `mempalace_create_tunnel` — Create an EXPLICIT cross-wing tunnel between two locations. Use when you notice content in one project relates to another (e.g. API design in `project_api` connects to schema in `project_database`).
+- `mempalace_find_tunnels` — Find rooms that bridge two wings via *implicit* overlap (rooms whose drawers naturally share content across wings — discovered, not declared)
+  - `wing_a`, `wing_b`: optional filters; omit both to scan all wing pairs
+- `mempalace_create_tunnel` — Create an *explicit* cross-wing tunnel: a user/agent-declared link between two locations. Use when you notice content in one project relates to another (e.g. API design in `project_api` connects to schema in `project_database`).
   - `source_wing`, `source_room`, `target_wing`, `target_room` (required)
   - `label`: short description of the relationship
   - `source_drawer_id`, `target_drawer_id`: anchor to specific drawers
@@ -118,7 +118,9 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 - `mempalace_diary_read` — Read recent diary entries
   - `agent_name` (required)
   - `last_n`: number of entries (default 10)
-- `mempalace_memories_filed_away` — Acknowledge the latest silent auto-save checkpoint and report how many messages were tucked into drawers. Call at the START of a session to confirm prior-conversation persistence.
+- `mempalace_memories_filed_away` — Acknowledge the latest silent auto-save checkpoint.
+  - Returns: how many messages were tucked into drawers since the last ack
+  - When to call: at the START of a session, to confirm prior-conversation persistence
 
 ## Setup
 
