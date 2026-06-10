@@ -1467,6 +1467,35 @@ def test_quarantine_invalid_hnsw_metadata_keeps_consistent_missing_dimensionalit
     assert seg.exists()
 
 
+def test_quarantine_invalid_hnsw_metadata_keeps_post_deletion_missing_dimensionality(tmp_path):
+    """A deleted-from segment has total_elements_added > live label count (the
+    counter is monotonic); that dim-None shape is recoverable, not corruption (#1710).
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 5,
+                "max_seq_id": None,
+                "id_to_label": {"a": 1, "b": 2},
+                "label_to_id": {1: "a", 2: "b"},
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
 def test_quarantine_invalid_hnsw_metadata_renames_mismatched_missing_dimensionality(tmp_path):
     palace = tmp_path / "palace"
     palace.mkdir()
