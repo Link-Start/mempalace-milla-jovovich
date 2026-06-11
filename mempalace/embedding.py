@@ -32,6 +32,7 @@ rather than hard-failing — mining must still work on a laptop without CUDA.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,10 @@ _AUTO_ORDER = [
 ]
 
 _EF_CACHE: dict = {}
+# Check-then-construct on the cache must be atomic: without it, two threads
+# resolving the same key each keep their own EF instance, and each instance
+# later lazy-loads its own copy of the model.
+_EF_CACHE_LOCK = threading.Lock()
 _WARNED: set = set()
 
 
@@ -179,51 +184,72 @@ class EmbeddinggemmaONNX:
         self._tokenizer = None
         self._np = None
         self._output_idx = None
+        # Instances are shared across threads via _EF_CACHE; serialize the
+        # one-time model load so concurrent cold calls cannot build (and
+        # transiently hold) two full model sessions.
+        self._load_lock = threading.Lock()
 
     def _lazy_load(self) -> None:
         if self._session is not None:
             return
-        try:
-            import numpy as np
-            import onnxruntime as ort
-            from huggingface_hub import hf_hub_download
-            from tokenizers import Tokenizer
-        except ImportError as e:
-            raise ImportError(
-                "EmbeddinggemmaONNX requires huggingface_hub, tokenizers, and "
-                "numpy — these ship with mempalace core, so this error usually "
-                "means one was uninstalled or pinned to an incompatible version. "
-                "Reinstall with: pip install --upgrade --force-reinstall mempalace"
-            ) from e
+        with self._load_lock:
+            if self._session is not None:
+                return
+            try:
+                import numpy as np
+                import onnxruntime as ort
+                from huggingface_hub import hf_hub_download
+                from tokenizers import Tokenizer
+            except ImportError as e:
+                raise ImportError(
+                    "EmbeddinggemmaONNX requires huggingface_hub, tokenizers, and "
+                    "numpy — these ship with mempalace core, so this error usually "
+                    "means one was uninstalled or pinned to an incompatible version. "
+                    "Reinstall with: pip install --upgrade --force-reinstall mempalace"
+                ) from e
 
-        logger.info(
-            "Downloading %s/%s (cached after first run)…",
-            _EMBEDDINGGEMMA_REPO,
-            _EMBEDDINGGEMMA_ONNX,
-        )
-        model_path = hf_hub_download(
-            _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
-        )
-        hf_hub_download(
-            _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX + "_data"
-        )
-        tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
+            logger.info(
+                "Downloading %s/%s (cached after first run)…",
+                _EMBEDDINGGEMMA_REPO,
+                _EMBEDDINGGEMMA_ONNX,
+            )
+            model_path = hf_hub_download(
+                _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX
+            )
+            hf_hub_download(
+                _EMBEDDINGGEMMA_REPO, subfolder="onnx", filename=_EMBEDDINGGEMMA_ONNX + "_data"
+            )
+            tok_path = hf_hub_download(_EMBEDDINGGEMMA_REPO, filename="tokenizer.json")
 
-        self._session = ort.InferenceSession(model_path, providers=self._providers)
-        out_names = [o.name for o in self._session.get_outputs()]
-        # Model card: sentence_embedding is the pooled output (last_hidden_state
-        # is the per-token output we don't want).
-        self._output_idx = (
-            out_names.index("sentence_embedding") if "sentence_embedding" in out_names else 1
-        )
+            session = ort.InferenceSession(model_path, providers=self._providers)
+            out_names = [o.name for o in session.get_outputs()]
+            # Model card: sentence_embedding is the pooled output (last_hidden_state
+            # is the per-token output we don't want).
+            output_idx = (
+                out_names.index("sentence_embedding") if "sentence_embedding" in out_names else 1
+            )
 
-        tokenizer = Tokenizer.from_file(tok_path)
-        tokenizer.enable_padding()
-        tokenizer.enable_truncation(max_length=_EMBEDDINGGEMMA_MAX_LEN)
-        self._tokenizer = tokenizer
-        self._np = np
+            tokenizer = Tokenizer.from_file(tok_path)
+            tokenizer.enable_padding()
+            tokenizer.enable_truncation(max_length=_EMBEDDINGGEMMA_MAX_LEN)
+            self._output_idx = output_idx
+            self._tokenizer = tokenizer
+            self._np = np
+            # Session is assigned last: the unlocked fast path above treats a
+            # non-None session as "fully loaded", so every other attribute
+            # must already be in place when it becomes visible.
+            self._session = session
 
-    def __call__(self, input: list[str]) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+    def __call__(self, input: str | list[str] | None) -> list[list[float]]:  # noqa: A002 — ChromaDB EF protocol
+        if isinstance(input, str):
+            # A bare string would be iterated character by character below,
+            # silently producing one garbage vector per character.
+            input = [input]
+        if input is None or len(input) == 0:
+            # None or zero docs: nothing to embed; skip the lazy model
+            # download. len() over truthiness so an array-like documents
+            # sequence is not rejected by ambiguous-truth-value semantics.
+            return []
         self._lazy_load()
         np = self._np
         embeddings: list[list[float]] = []
@@ -275,18 +301,22 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
 
     providers, effective = _resolve_providers(device)
     cache_key = (model, tuple(providers))
-    cached = _EF_CACHE.get(cache_key)
+    cached = _EF_CACHE.get(cache_key)  # lock-free fast path; dict.get is GIL-atomic
     if cached is not None:
         return cached
+    with _EF_CACHE_LOCK:
+        cached = _EF_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
-    if model == "embeddinggemma":
-        ef = EmbeddinggemmaONNX(preferred_providers=providers)
-    else:
-        # Default: minilm (or anything we don't recognize — back-compat win).
-        ef_cls = _build_ef_class()
-        ef = ef_cls(preferred_providers=providers)
+        if model == "embeddinggemma":
+            ef = EmbeddinggemmaONNX(preferred_providers=providers)
+        else:
+            # Default: minilm (or anything we don't recognize — back-compat win).
+            ef_cls = _build_ef_class()
+            ef = ef_cls(preferred_providers=providers)
 
-    _EF_CACHE[cache_key] = ef
+        _EF_CACHE[cache_key] = ef
     logger.info(
         "Embedding function initialized (model=%s device=%s providers=%s)",
         model,

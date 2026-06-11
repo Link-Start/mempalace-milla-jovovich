@@ -9,6 +9,8 @@ tokenizers/numpy) — CI runs only core deps by default.
 """
 
 import sys
+import threading
+import time
 
 import pytest
 
@@ -252,9 +254,79 @@ def test_batch_size_below_one_is_rejected():
 
 
 def test_call_empty_input_returns_empty(patched_lazy_load):
-    """Zero docs must yield zero embeddings, not a zero-row session.run."""
+    """Zero docs must yield zero embeddings without loading the model."""
     ef = embedding.EmbeddinggemmaONNX()
     assert ef([]) == []
+    assert ef(None) == []
+    assert patched_lazy_load["hf_hub_download"] == 0, "empty input must not trigger the download"
+
+
+def test_call_bare_string_is_wrapped(patched_lazy_load):
+    """A single string is one document, not a sequence of characters."""
+    ef = embedding.EmbeddinggemmaONNX()
+    out = ef("standalone document")
+    assert np.asarray(out).shape == (1, 384)
+
+
+def test_concurrent_first_calls_load_model_once(patched_lazy_load, monkeypatch):
+    """Cold concurrent calls must build exactly one session.
+
+    Instances are shared across threads via _EF_CACHE; without the load
+    lock, two cold callers would transiently hold two full model sessions.
+    """
+    import huggingface_hub
+
+    fixture_download = huggingface_hub.hf_hub_download
+
+    def slow_download(*args, **kwargs):
+        time.sleep(0.05)  # widen the race window the lock must close
+        return fixture_download(*args, **kwargs)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", slow_download)
+
+    ef = embedding.EmbeddinggemmaONNX()
+    barrier = threading.Barrier(2)
+    results = [None, None]
+
+    def worker(slot):
+        barrier.wait(timeout=5)
+        results[slot] = ef([f"doc {slot}"])
+
+    threads = [threading.Thread(target=worker, args=(slot,)) for slot in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert patched_lazy_load["InferenceSession"] == 1
+    assert all(r is not None and len(r) == 1 for r in results)
+
+
+def test_concurrent_get_embedding_function_single_instance(monkeypatch):
+    """Concurrent cache misses must converge on one shared EF instance.
+
+    The instance-level load lock is not enough on its own: if the factory's
+    check-then-construct is unsynchronized, each thread keeps its own
+    instance and each one later loads its own copy of the model.
+    """
+    monkeypatch.setattr(
+        embedding, "_resolve_providers", lambda device: (["CPUExecutionProvider"], "cpu")
+    )
+    barrier = threading.Barrier(2)
+    instances = [None, None]
+
+    def worker(slot):
+        barrier.wait(timeout=5)
+        instances[slot] = embedding.get_embedding_function(device="cpu", model="embeddinggemma")
+
+    threads = [threading.Thread(target=worker, args=(slot,)) for slot in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert instances[0] is not None, "worker thread did not complete"
+    assert instances[0] is instances[1], "factory must hand every thread the same EF"
 
 
 def test_get_embedding_function_dispatches_to_embeddinggemma(monkeypatch):
