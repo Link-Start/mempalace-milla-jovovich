@@ -182,9 +182,6 @@ def test_private_delimited_sha256_uses_length_prefixing():
     assert left != right
 
 
-
-
-
 def test_private_delimited_sha256_truncation_honoured():
     """Truncation argument actually shortens the hex output."""
     result = ids._delimited_sha256(("a", "b"), 8)

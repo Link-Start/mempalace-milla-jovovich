@@ -49,7 +49,7 @@ def _delimited_sha256(parts: tuple[object, ...], truncate: int) -> str:
     e.g. ``valid_from=None`` joins as the literal string ``"None"`` rather
     than crashing.
     """
-    key = "".join(f"{len(part)}:{part}" for part in (str(p) for p in parts)).encode()
+    key = "".join(f"{len(part)}:{part}" for part in map(str, parts)).encode()
     return hashlib.sha256(key).hexdigest()[:truncate]
 
 
