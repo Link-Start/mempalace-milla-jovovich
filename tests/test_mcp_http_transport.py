@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -48,7 +49,7 @@ def _wait_for_healthz(proc: subprocess.Popen, port: int, timeout: float = 20.0) 
     raise AssertionError(f"HTTP server did not become ready: {last_error!r}")
 
 
-def _rpc(port: int, method: str, params: dict | None = None, req_id: int = 1):
+def _rpc(port: int, method: str, params: Optional[dict] = None, req_id: int = 1):
     payload = {
         "jsonrpc": "2.0",
         "id": req_id,
