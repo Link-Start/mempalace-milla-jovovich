@@ -4554,16 +4554,19 @@ def _start_idle_exit_watchdog() -> None:
     t.start()
 
 
-_HTTP_REQUEST_LOCK = threading.Lock()
-_HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
-
-
 def _json_rpc_parse_error(req_id=None):
     return {
         "jsonrpc": "2.0",
         "id": req_id,
         "error": {"code": -32700, "message": "Parse error"},
     }
+
+
+# Module-level lock and limit used by the HTTP transport.
+# Must be at module scope so _serve_http() and any future HTTP helpers
+# can reference them without a closure or import.
+_HTTP_REQUEST_LOCK = threading.Lock()
+_HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 
 def _serve_http(host: str, port: int) -> None:
