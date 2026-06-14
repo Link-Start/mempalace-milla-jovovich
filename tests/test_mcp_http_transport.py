@@ -1,24 +1,15 @@
+import http.client
 import json
 import socket
+import sys
 import threading
 import time
-import urllib.error
-import urllib.request
-
-_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
-def _urlopen(request, timeout):
-    return _HTTP_OPENER.open(request, timeout=timeout)
-
-
 from typing import Optional
 
 import pytest
 
 pytest.importorskip("chromadb")
-
-from mempalace import mcp_server
+from mempalace import mcp_server  # noqa: E402
 
 
 def _free_port() -> int:
@@ -67,41 +58,77 @@ def _fake_dispatch(request):
     }
 
 
+def _http_request(
+    port: int,
+    method: str,
+    path: str,
+    body: bytes | None = None,
+    headers: Optional[dict] = None,
+    timeout: float = 2.0,
+):
+    # Use http.client directly for loopback tests. urllib can honor proxy
+    # or macOS system proxy settings, which makes 127.0.0.1 readiness
+    # checks flaky in CI.
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        data = resp.read()
+        return resp.status, data
+    finally:
+        conn.close()
+
+
+def _wait_for_healthz(
+    port: int, thread: threading.Thread, errors: list, timeout: float = 20.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    last_error = None
+
+    while time.monotonic() < deadline:
+        if errors:
+            raise AssertionError(f"HTTP server thread crashed: {errors!r}")
+
+        if not thread.is_alive():
+            raise AssertionError("HTTP server thread exited before /healthz became ready")
+
+        try:
+            status, body = _http_request(port, "GET", "/healthz", timeout=1.0)
+            if status == 200 and body == b"ok\n":
+                return
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+            last_error = exc
+            time.sleep(0.1)
+
+    raise AssertionError(f"HTTP server did not become ready: {last_error!r}")
+
+
 @pytest.fixture(scope="module")
 def http_port():
     original_handle_request = mcp_server.handle_request
     mcp_server.handle_request = _fake_dispatch
 
     port = _free_port()
+    errors = []
+
+    def _run_server():
+        try:
+            mcp_server._serve_http("127.0.0.1", port)
+        except BaseException as exc:  # pragma: no cover - diagnostic path
+            errors.append(repr(exc))
+
     thread = threading.Thread(
-        target=mcp_server._serve_http,
-        args=("127.0.0.1", port),
+        target=_run_server,
+        name="test-mcp-http-transport",
         daemon=True,
     )
     thread.start()
 
-    deadline = time.monotonic() + 20
-    last_error = None
-    url = f"http://127.0.0.1:{port}/healthz"
-
-    while time.monotonic() < deadline:
-        try:
-            with _urlopen(url, timeout=1) as resp:
-                body = resp.read().decode("utf-8")
-            if resp.status == 200 and body == "ok\n":
-                break
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.1)
-    else:
+    try:
+        _wait_for_healthz(port, thread, errors)
+        yield port
+    finally:
         mcp_server.handle_request = original_handle_request
-        raise AssertionError(f"HTTP server did not become ready: {last_error!r}")
-
-    yield port
-
-    # The HTTP server thread is daemonized and intentionally left alone.
-    # Restoring the dispatcher keeps the rest of the suite isolated.
-    mcp_server.handle_request = original_handle_request
 
 
 def _rpc(port: int, method: str, params: Optional[dict] = None, req_id: int = 1):
@@ -111,19 +138,19 @@ def _rpc(port: int, method: str, params: Optional[dict] = None, req_id: int = 1)
         "method": method,
         "params": params or {},
     }
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{port}/mcp",
-        data=json.dumps(payload).encode("utf-8"),
+    status, body = _http_request(
+        port,
+        "POST",
+        "/mcp",
+        body=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
-        method="POST",
+        timeout=10.0,
     )
-    with _urlopen(request, timeout=10) as resp:
-        body = resp.read().decode("utf-8")
-        return resp.status, json.loads(body) if body else None
+    return status, json.loads(body.decode("utf-8")) if body else None
 
 
 def test_parse_args_defaults_to_stdio(monkeypatch):
-    monkeypatch.setattr("sys.argv", ["mempalace-mcp"])
+    monkeypatch.setattr(sys, "argv", ["mempalace-mcp"])
 
     args = mcp_server._parse_args()
 
@@ -134,7 +161,8 @@ def test_parse_args_defaults_to_stdio(monkeypatch):
 
 def test_parse_args_accepts_http_transport(monkeypatch):
     monkeypatch.setattr(
-        "sys.argv",
+        sys,
+        "argv",
         [
             "mempalace-mcp",
             "--transport",
@@ -154,11 +182,10 @@ def test_parse_args_accepts_http_transport(monkeypatch):
 
 
 def test_http_transport_serves_healthz(http_port):
-    with _urlopen(f"http://127.0.0.1:{http_port}/healthz", timeout=10) as resp:
-        body = resp.read().decode("utf-8")
+    status, body = _http_request(http_port, "GET", "/healthz", timeout=10.0)
 
-    assert resp.status == 200
-    assert body == "ok\n"
+    assert status == 200
+    assert body == b"ok\n"
 
 
 def test_http_transport_serves_initialize_ping_and_repeated_tools_list(http_port):
@@ -191,20 +218,17 @@ def test_http_transport_serves_initialize_ping_and_repeated_tools_list(http_port
 
 
 def test_http_transport_returns_parse_error_for_invalid_json(http_port):
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{http_port}/mcp",
-        data=b"not-json",
+    status, body = _http_request(
+        http_port,
+        "POST",
+        "/mcp",
+        body=b"not-json",
         headers={"Content-Type": "application/json"},
-        method="POST",
+        timeout=10.0,
     )
+    payload = json.loads(body.decode("utf-8"))
 
-    with pytest.raises(urllib.error.HTTPError) as excinfo:
-        _urlopen(request, timeout=10)
-
-    body = excinfo.value.read().decode("utf-8")
-    payload = json.loads(body)
-
-    assert excinfo.value.code == 400
+    assert status == 400
     assert payload["error"]["code"] == -32700
     assert payload["error"]["message"] == "Parse error"
 
@@ -215,29 +239,27 @@ def test_http_transport_accepts_notifications_without_body(http_port):
         "method": "notifications/initialized",
         "params": {},
     }
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{http_port}/mcp",
-        data=json.dumps(payload).encode("utf-8"),
+    status, body = _http_request(
+        http_port,
+        "POST",
+        "/mcp",
+        body=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
-        method="POST",
+        timeout=10.0,
     )
 
-    with _urlopen(request, timeout=10) as resp:
-        body = resp.read()
-
-    assert resp.status == 202
+    assert status == 202
     assert body == b""
 
 
 def test_http_transport_returns_404_for_unknown_path(http_port):
-    request = urllib.request.Request(
-        f"http://127.0.0.1:{http_port}/not-mcp",
-        data=b"{}",
+    status, _body = _http_request(
+        http_port,
+        "POST",
+        "/not-mcp",
+        body=b"{}",
         headers={"Content-Type": "application/json"},
-        method="POST",
+        timeout=10.0,
     )
 
-    with pytest.raises(urllib.error.HTTPError) as excinfo:
-        _urlopen(request, timeout=10)
-
-    assert excinfo.value.code == 404
+    assert status == 404
