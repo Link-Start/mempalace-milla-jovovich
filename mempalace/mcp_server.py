@@ -193,6 +193,23 @@ def _parse_args():
         metavar="NAME",
         help="Storage backend to use (default: config/env/detected/chroma)",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="Serve MCP over stdio (default) or in-process HTTP",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="HTTP host to bind when --transport=http (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="HTTP port to bind when --transport=http (default: 8765)",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         logger.debug("Ignoring unknown args: %s", unknown)
@@ -4537,22 +4554,118 @@ def _start_idle_exit_watchdog() -> None:
     t.start()
 
 
-def main():
-    """MCP server entry point for the ``mempalace-mcp`` console script.
+_HTTP_REQUEST_LOCK = threading.Lock()
+_HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
-    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so
-    any subprocess this server spawns inherits a clean env. Host
-    applications that call ``main()`` programmatically should be aware
-    that the parent process loses ``PYTHONPATH`` as well. Library imports
-    (``import mempalace.searcher`` from a host app) do NOT trigger this
-    side effect; only the CLI/MCP entry points pop the env var.
+
+def _json_rpc_parse_error(req_id=None):
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32700, "message": "Parse error"},
+    }
+
+
+def _serve_http(host: str, port: int) -> None:
+    """Serve JSON-RPC over HTTP in-process.
+
+    This transport intentionally reuses the same ``handle_request`` dispatcher
+    as stdio. The only change is the framing layer: HTTP mode avoids a
+    long-lived stdout pipe for operators who run MemPalace behind an HTTP MCP
+    client/proxy for days at a time.
     """
-    # Drop leaked PYTHONPATH so any subprocess this server spawns starts
-    # with a clean env. The sys.path filter in mempalace/__init__.py
-    # already protects this process from the same ABI mismatch; here we
-    # extend the protection to children.
-    os.environ.pop("PYTHONPATH", None)
+
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse
+
+    class _MCPHTTPServer(ThreadingHTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            logger.info("HTTP %s - " + fmt, self.client_address[0], *args)
+
+        def _send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_json(self, status: int, payload: dict) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send_bytes(status, body, "application/json; charset=utf-8")
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/healthz":
+                self._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
+                return
+
+            self.send_error(404, "Not Found")
+
+        def do_POST(self):
+            path = urlparse(self.path).path
+            if path != "/mcp":
+                self.send_error(404, "Not Found")
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+            except (TypeError, ValueError):
+                content_length = 0
+
+            if content_length < 0 or content_length > _HTTP_MAX_REQUEST_BYTES:
+                self._send_json(
+                    413,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {"code": -32600, "message": "Request too large"},
+                    },
+                )
+                return
+
+            raw = self.rfile.read(content_length)
+
+            try:
+                request = json.loads(raw.decode("utf-8"))
+            except Exception as exc:
+                logger.warning("HTTP JSON-RPC parse error: %s", exc)
+                self._send_json(400, _json_rpc_parse_error())
+                return
+
+            # Preserve the single-process / single-palace-handle behavior that
+            # stdio deployments rely on. HTTP gives us a safer transport, not
+            # concurrent Chroma/HNSW mutation.
+            with _HTTP_REQUEST_LOCK:
+                response = handle_request(request)
+
+            if response is None:
+                # JSON-RPC notifications intentionally have no response body.
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                return
+
+            self._send_json(200, response)
+
+    with _MCPHTTPServer((host, port), _Handler) as httpd:
+        logger.info("MemPalace MCP HTTP server listening on http://%s:%s/mcp", host, port)
+        try:
+            httpd.serve_forever(poll_interval=0.5)
+        except KeyboardInterrupt:
+            logger.info("MemPalace MCP HTTP server shutting down")
+
+
+def _run_stdio_loop() -> None:
     _restore_stdout()
+
     # Force UTF-8 on stdio. MCP JSON-RPC is UTF-8, but Python on Windows
     # defaults stdin/stdout to the system codepage (e.g. cp1251), which
     # corrupts non-ASCII payloads and surfaces as generic -32000 errors on
@@ -4563,29 +4676,37 @@ def main():
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (AttributeError, OSError):
                 pass
+
     logger.info("MemPalace MCP Server starting...")
+
     # Pre-flight: probe HNSW capacity before any tool call so the warning
     # is visible at startup rather than on first use (#1222). Pure
     # filesystem read; never opens a chromadb client.
     _refresh_sqlite_integrity_status()
     _refresh_vector_disabled_flag()
+
     # Opt-in: pre-load the embedder so the first chromadb-write tool call
     # does not pay the ONNX/CoreML cold-load tax under the MCP client
     # timeout (#1495). Default off — preserves current startup latency.
     _maybe_eager_warmup_embedder()
+
     # Idle auto-exit: release ChromaDB file handles from stale servers
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
+
     while True:
         try:
             line = sys.stdin.readline()
             if not line:
                 break
+
             line = line.strip()
             if not line:
                 continue
+
             request = json.loads(line)
             response = handle_request(request)
+
             if response is not None:
                 sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
                 sys.stdout.flush()
@@ -4593,6 +4714,61 @@ def main():
             break
         except Exception as e:
             logger.error(f"Server error: {e}")
+
+
+def _run_http_loop() -> None:
+    # In HTTP mode there is no JSON-RPC stdio channel. Keeping the import-time
+    # stdout->stderr guard in place means any accidental print from a dependency
+    # still cannot masquerade as an HTTP response.
+    logger.info("MemPalace MCP HTTP server starting...")
+
+    # The HTTP transport exists for long-lived deployments. Do the cheap
+    # filesystem-only probe before binding, but never make the listener wait on
+    # optional embedder/HNSW warmup. Operators and tests should see /healthz as
+    # soon as the process is alive.
+    _refresh_vector_disabled_flag()
+    _start_idle_exit_watchdog()
+
+    raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
+    if raw_warmup in _WARMUP_TRUTHY:
+        threading.Thread(
+            target=_maybe_eager_warmup_embedder,
+            name="mcp-http-eager-warmup",
+            daemon=True,
+        ).start()
+    elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
+        # Keep the same warning behavior as stdio mode for typo values.
+        _maybe_eager_warmup_embedder()
+
+    _serve_http(_args.host, _args.port)
+
+
+def main():
+    """MCP server entry point for the ``mempalace-mcp`` console script.
+
+    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so any
+    subprocess this server spawns inherits a clean env. Host applications that
+    call ``main()`` programmatically should be aware that the parent process
+    loses ``PYTHONPATH`` as well. Library imports do NOT trigger this side
+    effect; only the CLI/MCP entry point does.
+
+    Transports:
+    - ``stdio`` remains the default for existing Claude/MCP deployments.
+    - ``http`` is opt-in and serves JSON-RPC POSTs at ``/mcp`` in the same
+      process, avoiding the long-lived stdio framing failure surface from
+      #1801.
+    """
+
+    # Drop leaked PYTHONPATH so any subprocess this server spawns starts
+    # with a clean env. The sys.path filter in mempalace/__init__.py
+    # already protects this process from the same ABI mismatch; here we
+    # extend the protection to children.
+    os.environ.pop("PYTHONPATH", None)
+
+    if _args.transport == "http":
+        _run_http_loop()
+    else:
+        _run_stdio_loop()
 
 
 if __name__ == "__main__":
