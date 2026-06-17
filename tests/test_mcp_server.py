@@ -1157,6 +1157,18 @@ class TestSearchTool:
         result = tool_search(query="JWT", source_file="x" * 5000)
         assert "error" in result
 
+    def test_search_rejects_non_string_source_file(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        # A non-string source_file (e.g. a JSON number, which the schema's
+        # string type does not coerce) must yield a clean validation error,
+        # not an unhandled AttributeError from .strip().
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        result = tool_search(query="JWT", source_file=42)
+        assert "error" in result
+
     def test_search_rejects_lone_surrogate_source_file(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):

@@ -915,9 +915,13 @@ def _sanitize_optional_source_file(value: str = None) -> str:
     add/upsert chokes on null bytes / lone surrogates, #1235), so guard those
     for parity with ``sanitize_name``. Blank / whitespace-only is "no filter".
     """
-    if value is None or not value.strip():
+    if value is None:
         return None
+    if not isinstance(value, str):
+        raise ValueError("source_file must be a string")
     value = value.strip()
+    if not value:
+        return None
     if "\x00" in value:
         raise ValueError("source_file contains null bytes")
     if value != strip_lone_surrogates(value):
