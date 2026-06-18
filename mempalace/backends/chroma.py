@@ -777,7 +777,8 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
 
         out["threshold"] = threshold
         stale_below_threshold = (
-            divergence > 0
+            not has_explicit_sync_threshold
+            and divergence > 0
             and metadata_age_seconds is not None
             and metadata_age_seconds >= _HNSW_PERSISTENT_DIVERGENCE_GRACE_SECONDS
         )

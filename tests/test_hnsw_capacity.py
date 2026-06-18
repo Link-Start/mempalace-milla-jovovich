@@ -677,3 +677,18 @@ def test_capacity_status_flags_stale_below_floor_divergence(tmp_path):
     assert info["status"] == "diverged"
     assert info["diverged"] is True
     assert "persisted below" in info["message"]
+
+
+def test_capacity_status_ok_with_stale_metadata_under_explicit_threshold(tmp_path):
+    """An idle database with an explicit sync threshold and a gap within tolerance must remain OK."""
+    seg = "seg-1816-stale-ok"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1712, segment_id=seg, sync_threshold=2)
+    _write_pickle(str(tmp_path), seg, hnsw_count=1711)
+    pickle_path = tmp_path / seg / "index_metadata.pickle"
+    old = time.time() - 400.0
+    os.utime(pickle_path, (old, old))
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["divergence"] == 1
+    assert info["threshold"] == 4
+    assert info["status"] == "ok"
+    assert info["diverged"] is False
