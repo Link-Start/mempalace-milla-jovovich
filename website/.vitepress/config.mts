@@ -11,6 +11,7 @@ function normalizeBase(base?: string): string {
 
 const docsBase = normalizeBase(process.env.DOCS_BASE || '/')
 const editBranch = process.env.DOCS_EDIT_BRANCH || 'main'
+const gaId = process.env.MEMPALACE_DOCS_GA_ID
 
 export default withMermaid(
   defineConfig({
@@ -20,12 +21,18 @@ export default withMermaid(
 
     head: [
       ['link', { rel: 'icon', href: `${docsBase}mempalace_logo.png` }],
+      ['link', { rel: 'preconnect', href: 'https://api.fontshare.com' }],
+      ['link', { href: 'https://api.fontshare.com/v2/css?f[]=neue-machina@300,400,500,700,800&f[]=satoshi@300,400,500,700&display=swap', rel: 'stylesheet' }],
       ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
       ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
-      ['link', { href: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap', rel: 'stylesheet' }],
+      ['link', { href: 'https://fonts.googleapis.com/css2?family=Onest:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap', rel: 'stylesheet' }],
       ['meta', { property: 'og:title', content: 'MemPalace — AI Memory System' }],
       ['meta', { property: 'og:description', content: '96.6% LongMemEval recall. Zero API calls. Local, free, open source.' }],
       ['meta', { property: 'og:image', content: `${docsBase}mempalace_logo.png` }],
+      ...(gaId ? [
+        ['script', { async: '', src: `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(gaId)}` }],
+        ['script', {}, `window.dataLayer = window.dataLayer || [];\nfunction gtag(){dataLayer.push(arguments);}\ngtag('js', new Date());\ngtag('config', ${JSON.stringify(gaId)});`],
+      ] as const : []),
     ],
 
     themeConfig: {
@@ -48,10 +55,13 @@ export default withMermaid(
               { text: 'Searching Memories', link: '/guide/searching' },
               { text: 'MCP Integration', link: '/guide/mcp-integration' },
               { text: 'Claude Code Plugin', link: '/guide/claude-code' },
+              { text: 'Claude Code Retention', link: '/guide/claude-code-retention' },
               { text: 'Gemini CLI', link: '/guide/gemini-cli' },
+              { text: 'Antigravity Plugin', link: '/guide/antigravity' },
               { text: 'OpenClaw Skill', link: '/guide/openclaw' },
               { text: 'Local Models', link: '/guide/local-models' },
               { text: 'Auto-Save Hooks', link: '/guide/hooks' },
+              { text: 'Cursor IDE Hooks', link: '/guide/cursor-hooks' },
               { text: 'Configuration', link: '/guide/configuration' },
             ],
           },

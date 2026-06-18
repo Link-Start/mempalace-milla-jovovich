@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 29 MCP tools.
+Detailed parameter schemas for all 33 MCP tools.
 
 ## Palace — Read Tools
 
@@ -10,7 +10,7 @@ Palace overview: total drawers, wing and room counts, AAAK spec, and memory prot
 
 **Parameters:** None
 
-**Returns:** `{ total_drawers, wings, rooms, palace_path, protocol, aaak_dialect }`
+**Returns:** `{ total_drawers, wings, rooms, protocol, aaak_dialect }`
 
 ---
 
@@ -114,6 +114,38 @@ Delete a drawer by ID. Irreversible.
 
 ---
 
+### `mempalace_mine`
+
+Mine a directory into the palace — the MCP equivalent of `mempalace mine`. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `source` | string | **Yes** | Directory to mine |
+| `mode` | string | No | `projects` (code/docs, default), `convos` (chat transcripts), or `extract` (office docs; needs the `mempalace[extract]` extra) |
+| `wing` | string | No | Target wing (default: source directory name) |
+| `agent` | string | No | Recorded on every drawer (default: `mempalace`) |
+| `limit` | integer | No | Max files to process (0 = all; default 0) |
+| `dry_run` | boolean | No | Report what would be filed without writing (default false) |
+| `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
+
+**Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
+
+---
+
+### `mempalace_sync`
+
+Prune drawers whose source files are gitignored, deleted, or moved. Returns a dry-run report by default; pass `apply=true` to commit deletions.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_dir` | string | No | Project root to scope the sync (auto-detected from drawer metadata if omitted) |
+| `wing` | string | No | Limit to one wing |
+| `apply` | boolean | No | Actually delete drawers; default is dry-run preview |
+
+**Returns:** `{ scanned, kept, gitignored, missing, no_source, out_of_scope, removed_drawers, removed_closets, dry_run, by_source }`
+
+---
+
 ### `mempalace_get_drawer`
 
 Fetch a single drawer by ID — returns full content and metadata.
@@ -122,7 +154,7 @@ Fetch a single drawer by ID — returns full content and metadata.
 |-----------|------|----------|-------------|
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
 
-**Returns:** `{ drawer: { id, wing, room, content, ... } }`
+**Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
 
 ---
 
@@ -305,6 +337,30 @@ Delete an explicit tunnel by its ID.
 
 ---
 
+### `mempalace_list_hallways`
+
+List within-wing hallway records (entity-to-entity co-occurrence links built at mine time). Optionally filter by wing.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `wing` | string | No | Filter hallways by wing |
+
+**Returns:** `[ { id, wing, entity_a, entity_b, co_occurrence_count, rooms, ... }, ... ]`
+
+---
+
+### `mempalace_delete_hallway`
+
+Delete a hallway record by its ID.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `hallway_id` | string | **Yes** | Hallway ID to delete |
+
+**Returns:** `{ deleted: bool }`
+
+---
+
 ### `mempalace_follow_tunnels`
 
 Follow tunnels from a room to see what it connects to in other wings. Returns connected rooms with drawer previews.
@@ -378,4 +434,4 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 
 **Parameters:** None
 
-**Returns:** `{ success, palace_path }`
+**Returns:** `{ success, message, drawers, vector_disabled[, vector_disabled_reason] }` (on no-palace: `{ success: false, message, drawers, vector_disabled }`; on exception: `{ success: false, error }`)
