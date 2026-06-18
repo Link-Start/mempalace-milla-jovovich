@@ -100,6 +100,12 @@ READABLE_EXTENSIONS = {
     ".csv",
     ".sql",
     ".toml",
+    # C# / .NET
+    ".cs",
+    ".csproj",
+    ".sln",
+    ".razor",
+    ".cshtml",
 } | PHP_EXTENSIONS
 
 SKIP_FILENAMES = {
