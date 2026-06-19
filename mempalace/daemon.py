@@ -741,6 +741,20 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
         daemon_threads = True
         allow_reuse_address = True
 
+        def server_bind(self):
+            # http.server's HTTPServer.server_bind() calls socket.getfqdn(host)
+            # to set server_name — a reverse-DNS lookup. For our 127.0.0.1 bind
+            # that lookup is useless, and on a host with slow or absent reverse
+            # DNS it blocks daemon startup for ~30s (until the resolver times
+            # out), which looks exactly like the daemon never coming up. Bind via
+            # TCPServer directly and set the name from the literal host instead.
+            import socketserver
+
+            socketserver.TCPServer.server_bind(self)
+            host, port = self.server_address[:2]
+            self.server_name = host
+            self.server_port = port
+
     # Privacy by architecture: the queue DB holds verbatim user content (diary
     # entries, source paths). Force owner-only perms on every file this process
     # creates — queue.sqlite3, its WAL/SHM sidecars, and any future artifact.
