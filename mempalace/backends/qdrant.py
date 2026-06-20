@@ -53,6 +53,12 @@ _PAYLOAD_DOCUMENT = "document"
 _PAYLOAD_METADATA = "metadata"
 _POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+# Page size for Qdrant's /points/scroll cursor. 4096 (up from the original
+# 256) cuts REST round-trips ~16x for any full-collection walk (#1796).
+# Qdrant's own docs suggest larger scroll batches are safe; this is still far
+# below typical REST payload-size limits for metadata-only (with_vector=False)
+# scrolls.
+_SCROLL_PAGE_SIZE = 4096
 _SUPPORTED_OPERATORS = frozenset(
     {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
 )
@@ -480,7 +486,7 @@ class _QdrantRESTClient:
         collection: str,
         *,
         qdrant_filter: Optional[dict] = None,
-        limit: int = 256,
+        limit: int = 4096,
         offset: Any = None,
         with_vector: bool = False,
     ) -> tuple[list[dict], Any]:
@@ -732,7 +738,7 @@ class QdrantCollection(BaseCollection):
             points, offset = self._client.scroll_points(
                 self._remote_collection,
                 qdrant_filter=qdrant_filter,
-                limit=256,
+                limit=_SCROLL_PAGE_SIZE,
                 offset=offset,
                 with_vector=with_vector,
             )
@@ -999,6 +1005,26 @@ class QdrantCollection(BaseCollection):
             metadatas=[row["metadata"] for row in rows] if spec.metadatas else [],
             embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
         )
+
+    def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
+        """Return every matching record's metadata in one cursor pass (#1796).
+
+        Overrides the default offset-paginated implementation, which would
+        call self.get(limit=, offset=) in a loop -- and since self.get() is
+        backed by a full _scroll_all() materialization, each page of that
+        loop would re-walk the entire collection from the start just to
+        discard everything outside its slice (O(n^2) over collection size).
+
+        This walks _scroll_all() exactly once and returns every matching
+        metadata dict directly -- the single-cursor-scroll fix requested in
+        issue #1796.
+        """
+        _validate_where(where)
+        q_filter = None if _requires_local_filter(where) else _qdrant_filter(where)
+        rows = self._scroll_all(qdrant_filter=q_filter, with_vector=False)
+        if where:
+            rows = [row for row in rows if _matches_where(row["metadata"], where)]
+        return [row["metadata"] for row in rows]
 
     def delete(self, *, ids=None, where=None):
         _validate_where(where)
