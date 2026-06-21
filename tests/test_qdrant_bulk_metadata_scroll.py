@@ -17,33 +17,59 @@ import types
 import sys
 from unittest import mock
 
+import pytest
+
 
 # ── Stub heavy deps so we can import mempalace modules in isolation ─────────
-def _install_stubs():
-    stub_np = sys.modules.get("numpy")
-    if stub_np is None:
-        import numpy  # noqa: F401  -- numpy is a real, light dependency here
+#
+# These names are only stubbed for the DURATION OF THIS MODULE's collection +
+# test run, via the autouse fixture below. Mutating sys.modules at import
+# time with no teardown (the previous approach) risked an order-dependent
+# flake: if pytest collected this file before something else that needed the
+# REAL mempalace.config / mempalace.searcher / etc., that other test would
+# silently get our fake module instead, with no error and no obvious cause.
+# (Maintainer review on #1832.)
+_STUB_MODULE_NAMES = [
+    "mempalace.knowledge_graph",
+    "mempalace.searcher",
+    "mempalace.palace_graph",
+    "mempalace.config",
+]
 
-    for name in [
-        "mempalace.knowledge_graph",
-        "mempalace.searcher",
-        "mempalace.palace_graph",
-        "mempalace.config",
-    ]:
+
+def _build_stub(name: str) -> types.ModuleType:
+    m = types.ModuleType(name)
+    m.KnowledgeGraph = lambda: types.SimpleNamespace()
+    m.search_memories = lambda *a, **kw: []
+    m.traverse = lambda *a, **kw: {}
+    m.find_tunnels = lambda *a, **kw: {}
+    m.graph_stats = lambda *a, **kw: {}
+    m.MempalaceConfig = lambda: types.SimpleNamespace(
+        palace_path="~/.mempalace/palace", collection_name="mempalace"
+    )
+    return m
+
+
+@pytest.fixture(autouse=True)
+def _stub_heavy_deps(monkeypatch):
+    """Install fake modules for the stub names, restored automatically on teardown.
+
+    monkeypatch.setitem(sys.modules, ...) records the original value (or
+    "absent") for each key and restores it when the test ends -- unlike the
+    previous bare module-level `if name not in sys.modules: sys.modules[name]
+    = stub` pattern, which left the stub installed permanently for the rest
+    of the test session once set.
+    """
+    for name in _STUB_MODULE_NAMES:
         if name not in sys.modules:
-            m = types.ModuleType(name)
-            m.KnowledgeGraph = lambda: types.SimpleNamespace()
-            m.search_memories = lambda *a, **kw: []
-            m.traverse = lambda *a, **kw: {}
-            m.find_tunnels = lambda *a, **kw: {}
-            m.graph_stats = lambda *a, **kw: {}
-            m.MempalaceConfig = lambda: types.SimpleNamespace(
-                palace_path="~/.mempalace/palace", collection_name="mempalace"
-            )
-            sys.modules[name] = m
+            monkeypatch.setitem(sys.modules, name, _build_stub(name))
+    yield
 
 
-_install_stubs()
+# numpy is a real, light dependency -- imported eagerly here (not stubbed)
+# so qdrant.py's own `import numpy as np` resolves to the real module both
+# during this file's first import below and during every test.
+import numpy  # noqa: E402,F401
 
 from mempalace.backends.base import (  # noqa: E402
     BaseCollection,

@@ -55,9 +55,17 @@ _POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # Page size for Qdrant's /points/scroll cursor. 4096 (up from the original
 # 256) cuts REST round-trips ~16x for any full-collection walk (#1796).
-# Qdrant's own docs suggest larger scroll batches are safe; this is still far
+# Qdrant's own docs suggest larger scroll batches are safe, and this is well
 # below typical REST payload-size limits for metadata-only (with_vector=False)
-# scrolls.
+# scrolls such as get_all_metadata().
+#
+# This constant also governs vector-bearing scrolls (with_vector=True), used
+# by _rows()/get() when embeddings are requested and by _query_local_exact()
+# for the $or/$contains local-filter query fallback. At 4096 rows per page,
+# high-dimensional embeddings make those particular responses tens of MB --
+# Qdrant handles it and round-trips still drop overall, but this is a real
+# trade-off, not a metadata-only optimization. (Noted in maintainer review
+# on #1832.)
 _SCROLL_PAGE_SIZE = 4096
 _SUPPORTED_OPERATORS = frozenset(
     {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
@@ -486,7 +494,7 @@ class _QdrantRESTClient:
         collection: str,
         *,
         qdrant_filter: Optional[dict] = None,
-        limit: int = 4096,
+        limit: int = _SCROLL_PAGE_SIZE,
         offset: Any = None,
         with_vector: bool = False,
     ) -> tuple[list[dict], Any]:
@@ -1015,16 +1023,16 @@ class QdrantCollection(BaseCollection):
         loop would re-walk the entire collection from the start just to
         discard everything outside its slice (O(n^2) over collection size).
 
-        This walks _scroll_all() exactly once and returns every matching
-        metadata dict directly -- the single-cursor-scroll fix requested in
-        issue #1796.
+        Delegates to self._rows(), the same single-scroll-plus-local-filter
+        helper that backs get()/delete(). With ids=None and
+        where_document=None, _rows() reduces to exactly one _scroll_all()
+        pass followed by an unconditional _matches_where() re-check on every
+        row -- the same filter logic get(), delete(), and lexical_search()
+        already use, so this can't independently drift from those call
+        sites. (Maintainer review on #1832: avoid duplicating the filter
+        dance inline.)
         """
-        _validate_where(where)
-        local_filter = _requires_local_filter(where)
-        q_filter = None if local_filter else _qdrant_filter(where)
-        rows = self._scroll_all(qdrant_filter=q_filter, with_vector=False)
-        if where and local_filter:
-            rows = [row for row in rows if _matches_where(row["metadata"], where)]
+        rows = self._rows(where=where)
         return [row["metadata"] for row in rows]
 
     def delete(self, *, ids=None, where=None):
