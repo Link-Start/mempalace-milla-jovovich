@@ -1612,6 +1612,127 @@ class TestWriteTools:
         assert result["vector_disabled"] is True
         assert result["vector_disabled_reason"] == "capacity mismatch"
 
+    def test_checkpoint_files_items_and_writes_diary(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_checkpoint
+
+        result = tool_checkpoint(
+            items=[
+                {"wing": "w", "room": "decisions", "content": "Use PostgreSQL for storage."},
+                {"wing": "w", "room": "backend", "content": "Cache sessions in Redis."},
+            ],
+            diary={"agent_name": "cursor-ide", "wing": "w", "entry": "SESSION|did.stuff|★"},
+        )
+        assert len(result["added"]) == 2
+        assert result["duplicates"] == []
+        assert result["errors"] == []
+        assert all(a["success"] for a in result["added"])
+        assert result["diary"]["success"] is True
+
+    def test_checkpoint_skips_semantic_duplicates(self, monkeypatch, config, kg):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "tool_check_duplicate",
+            lambda content, threshold=0.9: {
+                "is_duplicate": True,
+                "matches": [{"id": "x", "similarity": 0.95}],
+            },
+        )
+        called = {"add": False}
+
+        def _fail_add(**_kwargs):
+            called["add"] = True
+            return {"success": True}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _fail_add)
+
+        result = mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "already known"}]
+        )
+        assert result["added"] == []
+        assert len(result["duplicates"]) == 1
+        assert called["add"] is False
+
+    def test_checkpoint_reports_malformed_items(self, monkeypatch, config, kg):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        result = mcp_server.tool_checkpoint(items=[{"wing": "w", "room": "r"}, "not-a-dict"])
+        assert result["added"] == []
+        assert len(result["errors"]) == 2
+
+    def test_checkpoint_rejects_non_string_fields_without_calling_handlers(
+        self, monkeypatch, config, kg
+    ):
+        """A non-string content must be reported, never passed to the
+        single-item handlers where it would raise deep in sanitization."""
+        from mempalace import mcp_server
+
+        def _explode(*_a, **_k):
+            raise AssertionError("handlers must not run for malformed items")
+
+        monkeypatch.setattr(mcp_server, "tool_check_duplicate", _explode)
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _explode)
+
+        result = mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": {"not": "a string"}}]
+        )
+        assert result["added"] == []
+        assert len(result["errors"]) == 1
+        assert "non-empty strings" in result["errors"][0]["error"]
+
+    def test_checkpoint_files_when_dedup_check_errors(self, monkeypatch, config, kg):
+        """A dedup error is a genuine index failure (content is already
+        validated as a string); we still file rather than drop the memory."""
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "tool_check_duplicate",
+            lambda *a, **k: {"error": "Duplicate check failed"},
+        )
+        filed = {}
+
+        def _add(**kwargs):
+            filed.update(kwargs)
+            return {"success": True, "drawer_id": "d1"}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _add)
+
+        result = mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "keep me"}]
+        )
+        assert len(result["added"]) == 1
+        assert filed["content"] == "keep me"
+
+    def test_checkpoint_reports_malformed_diary(self, monkeypatch, config, kg):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+
+        def _fail_diary(*_a, **_k):
+            raise AssertionError("diary_write must not run for malformed diary")
+
+        monkeypatch.setattr(mcp_server, "tool_diary_write", _fail_diary)
+
+        result = mcp_server.tool_checkpoint(items=[], diary={"agent_name": "x"})
+        assert "diary" not in result
+        assert any("diary entry" in e.get("error", "") for e in result["errors"])
+
+    def test_checkpoint_registered_in_tools(self):
+        from mempalace import mcp_server
+
+        assert "mempalace_checkpoint" in mcp_server.TOOLS
+        assert mcp_server.TOOLS["mempalace_checkpoint"]["handler"] is mcp_server.tool_checkpoint
+
     def test_get_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_get_drawer
