@@ -2951,6 +2951,16 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
     Reuses the existing single-item handlers so dedup/idempotency/WAL
     behaviour is identical to calling them directly.
     """
+    # Inputs come from MCP clients and handle_request does not validate
+    # nested schemas, so guard every field here. A single malformed item
+    # must record an error and be skipped, never raise and abort the whole
+    # batch (the already-filed items in this call would otherwise be lost
+    # from the response).
+    try:
+        dedup_threshold = float(dedup_threshold)
+    except (ValueError, TypeError):
+        return {"error": "dedup_threshold must be a number"}
+
     out = {"added": [], "duplicates": [], "errors": []}
     if not isinstance(items, list):
         return {"error": "items must be a list of {wing, room, content} objects"}
@@ -2961,25 +2971,42 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
         wing = item.get("wing")
         room = item.get("room")
         content = item.get("content")
-        if not (wing and room and content):
-            out["errors"].append({"item": item, "error": "wing, room, content required"})
+        # Non-empty strings only: a non-string here would raise deep in
+        # sanitize_content / strip_lone_surrogates.
+        if not all(isinstance(v, str) and v for v in (wing, room, content)):
+            out["errors"].append(
+                {"item": item, "error": "wing, room, content must be non-empty strings"}
+            )
             continue
         dup = tool_check_duplicate(content, threshold=dedup_threshold)
         if dup.get("is_duplicate"):
             out["duplicates"].append({"room": room, "matches": dup.get("matches", [])})
             continue
+        # On a dedup error (genuine index failure — content is guaranteed a
+        # string by the guard above) we still file rather than drop the
+        # memory: verbatim recall is the priority and add_drawer's own
+        # idempotency blocks exact duplicates.
         res = tool_add_drawer(wing=wing, room=room, content=content, added_by="checkpoint")
         if res.get("success"):
             out["added"].append(res)
         else:
             out["errors"].append(res)
-    if isinstance(diary, dict) and (diary.get("entry") or diary.get("content")):
-        out["diary"] = tool_diary_write(
-            agent_name=diary.get("agent_name", "cursor-ide"),
-            entry=diary.get("entry") or diary.get("content"),
-            topic=diary.get("topic", "session-checkpoint"),
-            wing=diary.get("wing", ""),
-        )
+    if diary is not None:
+        if not isinstance(diary, dict):
+            out["errors"].append({"diary": diary, "error": "diary must be an object"})
+        else:
+            entry = diary.get("entry") or diary.get("content")
+            if not isinstance(entry, str) or not entry:
+                out["errors"].append(
+                    {"diary": diary, "error": "diary entry must be a non-empty string"}
+                )
+            else:
+                out["diary"] = tool_diary_write(
+                    agent_name=diary.get("agent_name", "cursor-ide"),
+                    entry=entry,
+                    topic=diary.get("topic", "session-checkpoint"),
+                    wing=diary.get("wing", ""),
+                )
     return out
 
 
