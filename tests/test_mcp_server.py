@@ -1961,6 +1961,32 @@ class TestDeleteBySource:
             source_file="notes/clients.md",
         )
 
+    def _seed_closets(self, palace_path):
+        """Seed the AAAK index (closets) directly.
+
+        ``tool_add_drawer`` never builds closets — those are a miner-side
+        artifact — so to exercise the closet purge we add them straight to the
+        collection, keyed by the same ``source_file`` the drawers use: two for
+        the benchmark source, one for the real-client source.
+        """
+        from mempalace.palace import get_closets_collection
+
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["bench_closet_01", "bench_closet_02", "client_closet_01"],
+            documents=[
+                "topic: yoga retreat | coding job",
+                "topic: more bench noise",
+                "topic: GG Sauna client",
+            ],
+            metadatas=[
+                {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
+                {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"},
+                {"source_file": "notes/clients.md"},
+            ],
+        )
+        return closets_col
+
     def test_dry_run_reports_count_without_deleting(self, monkeypatch, config, palace_path, kg):
         self._seed(monkeypatch, config, palace_path, kg)
         from mempalace.mcp_server import tool_delete_by_source, tool_status
@@ -1973,6 +1999,18 @@ class TestDeleteBySource:
         # Nothing removed — all three drawers still present.
         assert tool_status()["total_drawers"] == 3
 
+    def test_dry_run_reports_closet_match_count(self, monkeypatch, config, palace_path, kg):
+        """Dry run surfaces the closet blast radius (#1722) without deleting."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        closets_col = self._seed_closets(palace_path)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
+        assert result["dry_run"] is True
+        assert result["closet_match_count"] == 2
+        # Nothing removed — all three closets still present.
+        assert len(closets_col.get(include=[])["ids"]) == 3
+
     def test_commit_deletes_only_matching_source(self, monkeypatch, config, palace_path, kg):
         self._seed(monkeypatch, config, palace_path, kg)
         from mempalace.mcp_server import tool_delete_by_source, tool_status
@@ -1983,6 +2021,22 @@ class TestDeleteBySource:
         assert result["deleted"] == 2
         # Only the real client drawer remains.
         assert tool_status()["total_drawers"] == 1
+
+    def test_commit_purges_matching_closets(self, monkeypatch, config, palace_path, kg):
+        """Deleting by source purges the matching closets too, so the AAAK
+        index keeps no stale pointers at the now-deleted drawers (#1722)."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        closets_col = self._seed_closets(palace_path)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl", dry_run=False)
+        assert result["success"] is True
+        assert result["deleted"] == 2
+        assert result["closets_deleted"] == 2
+        # The two benchmark closets are gone; the real-client closet survives.
+        remaining = closets_col.get(include=["metadatas"])
+        sources = {m["source_file"] for m in remaining["metadatas"]}
+        assert sources == {"notes/clients.md"}
 
     def test_no_match_is_idempotent_not_error(self, monkeypatch, config, palace_path, kg):
         self._seed(monkeypatch, config, palace_path, kg)

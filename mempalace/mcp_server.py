@@ -2061,6 +2061,41 @@ def tool_mine(
             _metadata_cache = None
 
 
+def _purge_source_closets(source_file: str, *, commit: bool) -> int:
+    """Count, and optionally delete, closets matching ``source_file`` exactly.
+
+    The closets collection is the searchable AAAK index layer; it is keyed by
+    ``source_file`` independently of the drawers collection, so a drawer-only
+    delete would strand stale index pointers at the deleted source (#1722).
+    Mirrors the closet-purge step in :func:`mempalace.sync.sync_palace` and the
+    re-mine purge in :func:`mempalace.palace.purge_file_closets`.
+
+    Best-effort: a missing or unavailable closet collection yields 0 and never
+    raises, so it can never abort a drawer delete that has already committed.
+    Deletion is pushed down via ``delete(where=...)`` so it survives palaces
+    larger than the 10k ``get()`` truncation; the returned count is the (best
+    effort) number of matching closets observed before the delete.
+    """
+    from .palace import get_closets_collection
+
+    try:
+        closets_col = get_closets_collection(_config.palace_path, create=False)
+    except Exception as exc:
+        logger.warning("Closet purge skipped (collection unavailable): %s", exc)
+        return 0
+    if closets_col is None:
+        return 0
+    try:
+        ids = closets_col.get(where={"source_file": source_file}, include=[]).get("ids") or []
+        count = len(ids)
+        if commit and count:
+            closets_col.delete(where={"source_file": source_file})
+        return count
+    except Exception as exc:
+        logger.warning("Closet purge failed for %s: %s", source_file, exc)
+        return 0
+
+
 def tool_delete_by_source(source_file: str, dry_run: bool = True):
     """Delete every drawer whose ``source_file`` metadata matches exactly.
 
@@ -2076,9 +2111,13 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
     SQLite "too many variables" limit cannot be hit, regardless of how many
     drawers share the source (the reporter had 55k).
 
-    Defaults to a dry run: it reports the match count and a small sample so
-    the caller can confirm the blast radius before anything is removed. Pass
-    ``dry_run=False`` to commit the deletion (irreversible).
+    Also purges the matching closets (the AAAK index layer) so deleting the
+    drawers doesn't strand stale index pointers at the dead source (#1722).
+
+    Defaults to a dry run: it reports the drawer match count, the closet match
+    count, and a small sample so the caller can confirm the blast radius before
+    anything is removed. Pass ``dry_run=False`` to commit the deletion
+    (irreversible).
     """
     global _metadata_cache
     if not isinstance(source_file, str) or not source_file.strip():
@@ -2118,15 +2157,18 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
             break
 
     if dry_run:
+        closet_match_count = _purge_source_closets(source_file, commit=False)
         return {
             "success": True,
             "dry_run": True,
             "source_file": source_file,
             "match_count": match_count,
+            "closet_match_count": closet_match_count,
             "sample": sample,
             "hint": (
                 "No drawers were deleted. Re-run with dry_run=false to remove "
-                f"these {match_count} drawer(s)."
+                f"these {match_count} drawer(s) and {closet_match_count} index "
+                "entr(y/ies)."
                 if match_count
                 else "No drawers match this source_file."
             ),
@@ -2148,12 +2190,24 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
     try:
         col.delete(where=where)
         _metadata_cache = None
-        logger.info("Deleted %d drawer(s) from source: %s", match_count, source_file)
+        # Purge the matching closets too so the AAAK index doesn't keep stale
+        # pointers at the now-deleted drawers (#1722). Done after the drawer
+        # delete and intentionally best-effort: the drawers are already gone,
+        # so a closet-purge hiccup must not turn a successful delete into an
+        # error — it just leaves index cruft a later `repair` / re-mine clears.
+        closets_deleted = _purge_source_closets(source_file, commit=True)
+        logger.info(
+            "Deleted %d drawer(s) and %d closet(s) from source: %s",
+            match_count,
+            closets_deleted,
+            source_file,
+        )
         return {
             "success": True,
             "dry_run": False,
             "source_file": source_file,
             "deleted": match_count,
+            "closets_deleted": closets_deleted,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
