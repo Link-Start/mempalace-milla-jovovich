@@ -2937,6 +2937,52 @@ def tool_reconnect():
         return {"success": False, "error": str(e)}
 
 
+def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
+    """Batch session save in a single call.
+
+    Semantic-dedups each item, files the non-duplicates as drawers, then
+    writes one diary entry. Collapses the per-item ``check_duplicate`` /
+    ``add_drawer`` / ``diary_write`` sequence into one MCP request so the
+    host UI renders a single tool-call card (and keeps its spinner up for
+    the whole save) instead of one card per underlying call.
+
+    ``items`` is a list of ``{"wing", "room", "content"}`` dicts. ``diary``
+    is an optional ``{"agent_name", "entry", "topic"?, "wing"?}`` dict.
+    Reuses the existing single-item handlers so dedup/idempotency/WAL
+    behaviour is identical to calling them directly.
+    """
+    out = {"added": [], "duplicates": [], "errors": []}
+    if not isinstance(items, list):
+        return {"error": "items must be a list of {wing, room, content} objects"}
+    for item in items:
+        if not isinstance(item, dict):
+            out["errors"].append({"item": item, "error": "item must be an object"})
+            continue
+        wing = item.get("wing")
+        room = item.get("room")
+        content = item.get("content")
+        if not (wing and room and content):
+            out["errors"].append({"item": item, "error": "wing, room, content required"})
+            continue
+        dup = tool_check_duplicate(content, threshold=dedup_threshold)
+        if dup.get("is_duplicate"):
+            out["duplicates"].append({"room": room, "matches": dup.get("matches", [])})
+            continue
+        res = tool_add_drawer(wing=wing, room=room, content=content, added_by="checkpoint")
+        if res.get("success"):
+            out["added"].append(res)
+        else:
+            out["errors"].append(res)
+    if isinstance(diary, dict) and (diary.get("entry") or diary.get("content")):
+        out["diary"] = tool_diary_write(
+            agent_name=diary.get("agent_name", "cursor-ide"),
+            entry=diary.get("entry") or diary.get("content"),
+            topic=diary.get("topic", "session-checkpoint"),
+            wing=diary.get("wing", ""),
+        )
+    return out
+
+
 # ==================== MCP PROTOCOL ====================
 
 TOOLS = {
@@ -3246,6 +3292,52 @@ TOOLS = {
             "required": ["wing", "room", "content"],
         },
         "handler": tool_add_drawer,
+    },
+    "mempalace_checkpoint": {
+        "description": "Save a whole session in one call: semantic-dedups each item, files non-duplicates as drawers, then writes one diary entry. Use this instead of many separate check_duplicate/add_drawer/diary_write calls — it renders as a single tool-call card in the host UI.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "Verbatim items to file. Each is {wing, room, content} — content is the exact words, never summarized.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "wing": {"type": "string", "description": "Wing (project name)"},
+                            "room": {
+                                "type": "string",
+                                "description": "Room (short topic: decisions, backend...)",
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Verbatim content to store",
+                            },
+                        },
+                        "required": ["wing", "room", "content"],
+                    },
+                },
+                "diary": {
+                    "type": "object",
+                    "description": "Optional diary entry written after filing: {agent_name, entry, topic?, wing?}. entry is AAAK-format.",
+                    "properties": {
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Agent name (e.g. cursor-ide)",
+                        },
+                        "entry": {"type": "string", "description": "Diary entry in AAAK format"},
+                        "topic": {"type": "string", "description": "Topic tag (optional)"},
+                        "wing": {"type": "string", "description": "Target wing (optional)"},
+                    },
+                },
+                "dedup_threshold": {
+                    "type": "number",
+                    "description": "Similarity threshold 0-1 for the per-item dedup check (default 0.9)",
+                },
+            },
+            "required": ["items"],
+        },
+        "handler": tool_checkpoint,
     },
     "mempalace_delete_drawer": {
         "description": "Delete a drawer by ID. Irreversible.",

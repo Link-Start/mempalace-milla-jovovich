@@ -1527,6 +1527,67 @@ class TestWriteTools:
         assert result["vector_disabled"] is True
         assert result["vector_disabled_reason"] == "capacity mismatch"
 
+    def test_checkpoint_files_items_and_writes_diary(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_checkpoint
+
+        result = tool_checkpoint(
+            items=[
+                {"wing": "w", "room": "decisions", "content": "Use PostgreSQL for storage."},
+                {"wing": "w", "room": "backend", "content": "Cache sessions in Redis."},
+            ],
+            diary={"agent_name": "cursor-ide", "wing": "w", "entry": "SESSION|did.stuff|★"},
+        )
+        assert len(result["added"]) == 2
+        assert result["duplicates"] == []
+        assert result["errors"] == []
+        assert all(a["success"] for a in result["added"])
+        assert result["diary"]["success"] is True
+
+    def test_checkpoint_skips_semantic_duplicates(self, monkeypatch, config, kg):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server,
+            "tool_check_duplicate",
+            lambda content, threshold=0.9: {
+                "is_duplicate": True,
+                "matches": [{"id": "x", "similarity": 0.95}],
+            },
+        )
+        called = {"add": False}
+
+        def _fail_add(**_kwargs):
+            called["add"] = True
+            return {"success": True}
+
+        monkeypatch.setattr(mcp_server, "tool_add_drawer", _fail_add)
+
+        result = mcp_server.tool_checkpoint(
+            items=[{"wing": "w", "room": "r", "content": "already known"}]
+        )
+        assert result["added"] == []
+        assert len(result["duplicates"]) == 1
+        assert called["add"] is False
+
+    def test_checkpoint_reports_malformed_items(self, monkeypatch, config, kg):
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(
+            mcp_server, "tool_check_duplicate", lambda *a, **k: {"is_duplicate": False}
+        )
+        result = mcp_server.tool_checkpoint(items=[{"wing": "w", "room": "r"}, "not-a-dict"])
+        assert result["added"] == []
+        assert len(result["errors"]) == 2
+
+    def test_checkpoint_registered_in_tools(self):
+        from mempalace import mcp_server
+
+        assert "mempalace_checkpoint" in mcp_server.TOOLS
+        assert mcp_server.TOOLS["mempalace_checkpoint"]["handler"] is mcp_server.tool_checkpoint
+
     def test_get_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_get_drawer
