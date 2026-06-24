@@ -79,6 +79,7 @@ def _read_text_no_follow(filepath: Path, root: Path) -> Optional[str]:
             except OSError:
                 pass
 
+
 PHP_EXTENSIONS = {
     # Compound Blade templates such as ``view.blade.php`` are covered by the
     # final ``.php`` suffix.

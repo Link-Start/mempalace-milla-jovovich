@@ -102,26 +102,27 @@ def _write_text_replace_no_follow(path: str, text: str) -> None:
 
 def _copy_file_no_follow(src: str, dst: str, *, replace: bool = False) -> None:
     src_fd = _open_regular_file_no_follow(src)
-    flags = os.O_WRONLY | os.O_CREAT | _no_follow_flag()
-    flags |= os.O_TRUNC if replace else os.O_EXCL
-    dst_fd = os.open(dst, flags, 0o600)
     try:
-        with os.fdopen(src_fd, "rb") as src_f, os.fdopen(dst_fd, "wb") as dst_f:
-            shutil.copyfileobj(src_f, dst_f)
-        try:
-            shutil.copystat(src, dst, follow_symlinks=False)
-        except OSError:
-            pass
+        src_f = os.fdopen(src_fd, "rb")
     except Exception:
-        try:
-            os.close(src_fd)
-        except OSError:
-            pass
-        try:
-            os.close(dst_fd)
-        except OSError:
-            pass
+        os.close(src_fd)
         raise
+    # ``src_f`` now owns ``src_fd`` and closes it on exit.
+    with src_f:
+        flags = os.O_WRONLY | os.O_CREAT | _no_follow_flag()
+        flags |= os.O_TRUNC if replace else os.O_EXCL
+        dst_fd = os.open(dst, flags, 0o600)
+        try:
+            dst_f = os.fdopen(dst_fd, "wb")
+        except Exception:
+            os.close(dst_fd)
+            raise
+        with dst_f:
+            shutil.copyfileobj(src_f, dst_f)
+    try:
+        shutil.copystat(src, dst, follow_symlinks=False)
+    except OSError:
+        pass
 
 
 def _unique_backup_path(path: str, label: str) -> str:
@@ -958,7 +959,7 @@ def rebuild_index(
             try:
                 _close_chroma_handles(palace_path, backend=backend)
                 _delete_collection_if_exists(backend, palace_path, collection_name)
-                shutil.copy2(backup_path, sqlite_path)
+                _copy_file_no_follow(backup_path, sqlite_path, replace=True)
                 progress("  Backup restored. Palace is back to pre-repair state.")
             except Exception as restore_error:
                 progress(f"  Backup restore failed: {restore_error}")
