@@ -394,9 +394,9 @@ def scan_convos(convo_dir: str) -> list:
                     rel = filepath.relative_to(convo_path).as_posix()
                     try:
                         print(f"  SKIP: {rel} (symlink)", file=sys.stderr)
-                except OSError:
-                    pass
-                continue
+                    except OSError:
+                        pass
+                    continue
                 if not _is_regular_source_file(filepath, convo_path):
                     continue
                 files.append(filepath)
