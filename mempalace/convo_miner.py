@@ -21,6 +21,7 @@ from typing import Optional
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize
+from .entities import entities_metadata
 from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
@@ -499,6 +500,7 @@ def _file_chunks_locked(
                         "chunk_index": chunk["chunk_index"],
                         "added_by": agent,
                         "filed_at": filed_at,
+                        "entities": entities_metadata(chunk["content"]),
                         "authored_at": authored_at if authored_at is not None else filed_at,
                         "ingest_mode": "convos",
                         "extract_mode": extract_mode,
@@ -626,6 +628,22 @@ def mine_convos(
             dry_run=dry_run,
             extract_mode=extract_mode,
         )
+
+
+def _compute_hallways_for_wing_safe(wing, collection, drawers_filed):
+    """Auto-populate the associative graph from the entities just mined.
+
+    Best-effort: hallway computation must never fail an otherwise-good mine, and is
+    skipped when nothing new was filed.
+    """
+    if drawers_filed <= 0:
+        return
+    try:
+        from .hallways import compute_hallways_for_wing
+
+        compute_hallways_for_wing(wing, col=collection)
+    except Exception as exc:
+        print(f"  (hallways skipped: {exc})")
 
 
 def _mine_convos_impl(
@@ -785,6 +803,10 @@ def _mine_convos_impl(
             break
 
     if not dry_run:
+        # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
+        # connection to the Chroma DB, which can invalidate the live collection handle on
+        # some Chroma builds and make the hallway fetch fail.
+        _compute_hallways_for_wing_safe(wing, collection, total_drawers)
         _validate_palace_fts5_after_mine(palace_path)
 
     print(f"\n{'=' * 55}")
