@@ -1,7 +1,7 @@
 ---
 name: mempalace
 description: "MemPalace — Local AI memory with 96.6% recall. Semantic search, temporal knowledge graph, palace architecture (wings/rooms/drawers). Free, no cloud, no API keys."
-version: 3.4.0
+version: 3.5.0
 homepage: https://github.com/MemPalace/mempalace
 user-invocable: true
 metadata:
@@ -46,6 +46,10 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 
 ## Available Tools
 
+Full MCP surface: 35 tools. Destructive or host-level tools are documented so
+you know they exist, but use them only when the user explicitly asks or when a
+tool-specific workflow below says to.
+
 ### Search & Browse
 - `mempalace_search` — Semantic search across all memories. Always start here.
   - `query` (required): natural language search — keep it short, keywords or a question. Do NOT include system prompts or conversation context.
@@ -60,6 +64,8 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 - `mempalace_list_rooms` — Rooms within a wing (optional wing filter)
 - `mempalace_list_drawers` — Paginated drawer listing
   - `wing`, `room`: optional filters
+  - `since`: only drawers filed on/after this ISO date/time
+  - `before`: only drawers filed before this ISO date/time
   - `limit`: max results (default 20)
   - `offset`: pagination offset (default 0)
 - `mempalace_get_drawer` — Fetch a single drawer by ID. Returns full verbatim content and metadata.
@@ -97,6 +103,10 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
   - `wing`: optional filter
 - `mempalace_delete_tunnel` — Remove an explicit tunnel by ID
   - `tunnel_id` (required)
+- `mempalace_list_hallways` — List within-wing entity hallways (entity-to-entity co-occurrence links built at mine time)
+  - `wing`: optional filter
+- `mempalace_delete_hallway` — Remove a hallway record by ID
+  - `hallway_id` (required)
 - `mempalace_follow_tunnels` — From a room, follow explicit tunnels to connected drawers in other wings
   - `wing`, `room` (required)
 - `mempalace_graph_stats` — Graph connectivity overview
@@ -105,12 +115,36 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 - `mempalace_add_drawer` — Store verbatim content into a wing/room
   - `wing`, `room`, `content` (required)
   - `source_file`: optional source reference
+  - `added_by`: optional filing agent label
   - Checks for duplicates automatically
+- `mempalace_checkpoint` — Save a whole session in one call: dedup each item, file non-duplicates, then write one diary entry
+  - `items` (required): array of `{wing, room, content}`; content must be verbatim
+  - `diary`: optional `{agent_name, entry, topic?, wing?}`; entry should use AAAK format
+  - `dedup_threshold`: similarity threshold (default 0.9)
 - `mempalace_update_drawer` — Update an existing drawer's content and/or move it to a different wing/room
   - `drawer_id` (required)
   - `content`, `wing`, `room`: at least one must be provided (no-op otherwise)
 - `mempalace_delete_drawer` — Remove a drawer by ID
   - `drawer_id` (required)
+
+### Ingest & Cleanup
+- `mempalace_mine` — Mine a directory into the palace. Host-level ingest; call only when the user asks to import files.
+  - `source` (required): directory to mine
+  - `mode`: `projects` (default), `convos`, or `extract`
+  - `wing`: target wing (default: source directory name)
+  - `agent`: recorded on every drawer (default `mempalace`)
+  - `limit`: max files to process (0 = all)
+  - `dry_run`: preview without writing
+  - `extract`: convos extraction strategy (`exchange` default, or `general`)
+- `mempalace_sync` — Prune drawers whose source files are gitignored, deleted, or moved. Use dry-run first.
+  - `project_dir`: optional project root scope
+  - `wing`: optional wing scope
+  - `apply`: actually delete; default is dry-run preview
+- `mempalace_delete_by_source` — Bulk-delete drawers with one exact `source_file`. Destructive; use dry-run first.
+  - `source_file` (required): exact metadata value to remove
+  - `dry_run`: preview match count and sample (default true)
+
+### Diary & Session
 - `mempalace_diary_write` — Write a session diary entry
   - `agent_name` (required): your name/identifier
   - `entry` (required): what happened, what you learned, what matters
@@ -121,6 +155,12 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 - `mempalace_memories_filed_away` — Acknowledge the latest silent auto-save checkpoint.
   - Returns: how many messages were tucked into drawers since the last ack
   - When to call: at the START of a session, to confirm prior-conversation persistence
+
+### System
+- `mempalace_hook_settings` — Get or set auto-save hook behavior. Host-level setting; do not change silently.
+  - `silent_save`: true saves directly without MCP-level clutter
+  - `desktop_toast`: true shows a desktop notification when saves complete
+- `mempalace_reconnect` — Force reconnect to the palace database after external writes or stale index state
 
 ## Setup
 
